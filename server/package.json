@@ -1,0 +1,16 @@
+{
+  "name": "meridian-studio-server",
+  "version": "1.0.0",
+  "description": "Multi-Account Antigravity Orchestrator and Vibe-Coding Backend",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/**/*.test.js",
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "simple-git": "^3.27.0",
+    "ws": "^8.18.0"
+  }
+}
