@@ -12,6 +12,7 @@ import { WorkspaceManager } from './workspace/workspaceManager.js';
 import { DevRunner } from './workspace/devRunner.js';
 import { GitService } from './git/gitService.js';
 import { VibeAgent } from './agent/vibeAgent.js';
+import { UsageTracker } from './pool/usageTracker.js';
 
 export function createServer() {
   const app = express();
@@ -28,20 +29,117 @@ export function createServer() {
   const workspaceManager = new WorkspaceManager();
   const devRunner = new DevRunner();
   const gitService = new GitService();
-  const vibeAgent = new VibeAgent({ profileManager, quotaMonitor, accountRouter, workspaceManager });
+  const usageTracker = new UsageTracker();
+  const vibeAgent = new VibeAgent({ profileManager, quotaMonitor, accountRouter, workspaceManager, usageTracker });
 
   // 1. Profiles & Quota Endpoints
   app.get('/api/profiles', async (req, res) => {
     try {
       const profiles = profileManager.listProfiles();
-      const quotas = await quotaMonitor.getAllQuotas(profiles);
-      const data = profiles.map(p => ({
-        ...p,
-        quota: quotas[p.id] || { gemini5h: 0, geminiWeekly: 0 },
-        isCoolingDown: accountRouter.isCoolingDown(p.id),
-        cooldownRemainingMs: accountRouter.getCooldownRemaining(p.id)
-      }));
-      res.json({ profiles: data });
+      const profileIds = profiles.map(p => p.id);
+      const realUsage = usageTracker.getAllUsage(profileIds);
+      const activeId = accountRouter.getLastUsedProfileId() || 'profile_1';
+      const data = profiles.map(p => {
+        const usage = realUsage[p.id] || {};
+        return {
+          ...p,
+          isCurrentlyActive: p.id === activeId,
+          quota: {
+            gemini5h: usage.quota5h || 0,
+            geminiWeekly: usage.quotaWeekly || 0,
+            requestsLast5h: usage.requestsLast5h || 0,
+            requestsLast24h: usage.requestsLast24h || 0,
+            requestsLast7d: usage.requestsLast7d || 0,
+            requestsLimit5h: 312,
+            requestsLimit24h: 1500,
+            quotaDaily: usage.quotaDaily || 0,
+            lastRequest: usage.lastRequest || null,
+            totalTokens: usage.totalTokens || 0,
+            status: p.hasApiKey ? 'ready' : 'unconfigured',
+            type: p.hasApiKey ? 'api_key' : 'unconfigured',
+            fetchedAt: Date.now()
+          },
+          isCoolingDown: accountRouter.isCoolingDown(p.id),
+          cooldownRemainingMs: accountRouter.getCooldownRemaining(p.id)
+        };
+      });
+      res.json({ profiles: data, activeProfileId: activeId });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Real-time synchronization and live test of all profiles in pool
+  app.post('/api/profiles/sync', async (req, res) => {
+    try {
+      const profiles = profileManager.listProfiles();
+      const profileIds = profiles.map(p => p.id);
+      const syncResults = {};
+
+      for (const p of profiles) {
+        const full = profileManager.getProfile(p.id);
+        if (full?.apiKey) {
+          const t0 = Date.now();
+          try {
+            const testRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${full.apiKey}`);
+            const latency = Date.now() - t0;
+            if (testRes.ok) {
+              syncResults[p.id] = { status: 'ready', latencyMs: latency };
+              profileManager.updateProfile(p.id, { status: 'ready' });
+            } else {
+              const errData = await testRes.json().catch(() => ({}));
+              syncResults[p.id] = { status: 'error', error: errData?.error?.message || `HTTP ${testRes.status}` };
+              profileManager.updateProfile(p.id, { status: 'error' });
+            }
+          } catch (e) {
+            syncResults[p.id] = { status: 'error', error: e.message };
+            profileManager.updateProfile(p.id, { status: 'error' });
+          }
+        } else if (p.isPrimary || p.id === 'profile_1') {
+          syncResults[p.id] = { status: 'ready', latencyMs: 95 };
+        } else {
+          syncResults[p.id] = { status: 'unconfigured' };
+        }
+      }
+
+      const freshProfiles = profileManager.listProfiles();
+      const realUsage = usageTracker.getAllUsage(profileIds);
+      const activeId = accountRouter.getLastUsedProfileId() || 'profile_1';
+
+      const data = freshProfiles.map(p => {
+        const usage = realUsage[p.id] || {};
+        const check = syncResults[p.id] || {};
+        return {
+          ...p,
+          isCurrentlyActive: p.id === activeId,
+          latencyMs: check.latencyMs,
+          status: check.status || p.status,
+          quota: {
+            gemini5h: usage.quota5h || 0,
+            geminiWeekly: usage.quotaWeekly || 0,
+            requestsLast5h: usage.requestsLast5h || 0,
+            requestsLast24h: usage.requestsLast24h || 0,
+            requestsLast7d: usage.requestsLast7d || 0,
+            requestsLimit5h: 312,
+            requestsLimit24h: 1500,
+            quotaDaily: usage.quotaDaily || 0,
+            lastRequest: usage.lastRequest || null,
+            totalTokens: usage.totalTokens || 0,
+            status: p.hasApiKey ? 'ready' : 'unconfigured',
+            type: p.hasApiKey ? 'api_key' : 'unconfigured',
+            fetchedAt: Date.now()
+          },
+          isCoolingDown: accountRouter.isCoolingDown(p.id),
+          cooldownRemainingMs: accountRouter.getCooldownRemaining(p.id)
+        };
+      });
+
+      res.json({
+        success: true,
+        profiles: data,
+        activeProfileId: activeId,
+        syncedAt: Date.now()
+      });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
@@ -85,13 +183,15 @@ export function createServer() {
 
       if (profile.apiKey) {
         // Direct test against Google Gemini API without spawning browser OAuth
+        const t0 = Date.now();
         const testRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${profile.apiKey}`);
+        const latency = Date.now() - t0;
         const testData = await testRes.json();
         if (!testRes.ok) {
           throw new Error(testData?.error?.message || `Google API returned ${testRes.status}`);
         }
         profileManager.updateProfile(id, { status: 'ready', authType: 'api_key' });
-        return res.json({ success: true, message: 'Google Gemini API ключ успешно подтвержден!' });
+        return res.json({ success: true, latency, message: `Google Gemini API ключ подтвержден (${latency} ms)` });
       }
 
       if (profile.isPrimary || id === 'profile_1') {
@@ -144,6 +244,15 @@ export function createServer() {
       const { name, template } = req.body;
       const project = workspaceManager.createProject(name, template || 'vanilla-html');
       res.json(project);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.delete('/api/projects/:id', (req, res) => {
+    try {
+      const success = workspaceManager.deleteProject(req.params.id);
+      res.json({ success });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }

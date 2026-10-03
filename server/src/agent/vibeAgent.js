@@ -1,27 +1,83 @@
 import { spawn } from 'node:child_process';
 import { AGY_BIN } from '../config.js';
 
-export function parseToolsFromResponse(text) {
+export function parseToolsFromResponse(text, availableFiles = ['index.html', 'style.css', 'script.js']) {
   const tools = [];
+  const processedPaths = new Set();
 
-  // Match WRITE_FILE blocks
-  const writeFileRegex = /<<<TOOL:WRITE_FILE\s+path=["']([^"']+)["']>>>([\s\S]*?)<<<END_TOOL>>>/g;
+  if (!text || typeof text !== 'string') return tools;
+
+  // 1. Match <<<TOOL:WRITE_FILE path="..." >>> ... <<<END_TOOL>>>
+  const writeFileRegex = /<<<TOOL:WRITE_FILE\s+path=["']([^"']+)["']>>>([\s\S]*?)<<<END_TOOL>>>/gi;
   let match;
   while ((match = writeFileRegex.exec(text)) !== null) {
-    tools.push({
-      type: 'WRITE_FILE',
-      path: match[1].trim(),
-      content: match[2].replace(/^\n/, '')
-    });
+    const filePath = match[1].trim();
+    const content = match[2].trim();
+    if (!processedPaths.has(filePath)) {
+      tools.push({ type: 'WRITE_FILE', path: filePath, content });
+      processedPaths.add(filePath);
+    }
   }
 
-  // Match COMMAND blocks
-  const cmdRegex = /<<<TOOL:COMMAND>>>([\s\S]*?)<<<END_TOOL>>>/g;
+  // 2. Match <<<TOOL:COMMAND>>> ... <<<END_TOOL>>>
+  const cmdRegex = /<<<TOOL:COMMAND>>>([\s\S]*?)<<<END_TOOL>>>/gi;
   while ((match = cmdRegex.exec(text)) !== null) {
     tools.push({
       type: 'COMMAND',
       command: match[1].trim()
     });
+  }
+
+  // 3. Match code blocks with file path in language header:
+  // e.g. ```html:index.html, ```css:style.css, ```javascript:script.js, ```html file="index.html"
+  const langHeaderRegex = /```(?:[a-zA-Z0-9_-]+[:\s]+(?:file=["']?|path=["']?)?([a-zA-Z0-9_.\-\/]+\.[a-zA-Z0-9]+)["']?)\n([\s\S]*?)```/gi;
+  while ((match = langHeaderRegex.exec(text)) !== null) {
+    const filePath = match[1].trim();
+    const content = match[2].trim();
+    if (!processedPaths.has(filePath) && content.length > 5) {
+      tools.push({ type: 'WRITE_FILE', path: filePath, content });
+      processedPaths.add(filePath);
+    }
+  }
+
+  // 4. Match markdown filename headers right above code fence:
+  // e.g. Файл `index.html`: \n ```html \n ... \n ```
+  // or **index.html**: \n ```html \n ... \n ```
+  const prefixRegex = /(?:файл|file)?\s*[\*`]{1,2}([a-zA-Z0-9_.\-\/]+\.[a-zA-Z0-9]+)[\*`]{1,2}\s*:?\s*\n+```[a-zA-Z0-9_-]*\n([\s\S]*?)```/gi;
+  while ((match = prefixRegex.exec(text)) !== null) {
+    const filePath = match[1].trim();
+    const content = match[2].trim();
+    if (!processedPaths.has(filePath) && content.length > 5) {
+      tools.push({ type: 'WRITE_FILE', path: filePath, content });
+      processedPaths.add(filePath);
+    }
+  }
+
+  // 5. Intelligent Fallback for standalone HTML/CSS/JS blocks if no tools matched yet
+  if (tools.length === 0) {
+    // Check for full HTML document
+    const fullHtmlRegex = /```(?:html)?\s*\n(<!DOCTYPE html[\s\S]*?<\/html>)\s*```/i;
+    const htmlMatch = fullHtmlRegex.exec(text);
+    if (htmlMatch && !processedPaths.has('index.html')) {
+      tools.push({ type: 'WRITE_FILE', path: 'index.html', content: htmlMatch[1].trim() });
+      processedPaths.add('index.html');
+    }
+
+    // Check for CSS block
+    const cssRegex = /```css\s*\n([\s\S]*?)\s*```/i;
+    const cssMatch = cssRegex.exec(text);
+    if (cssMatch && cssMatch[1].trim().length > 15 && !processedPaths.has('style.css')) {
+      tools.push({ type: 'WRITE_FILE', path: 'style.css', content: cssMatch[1].trim() });
+      processedPaths.add('style.css');
+    }
+
+    // Check for JS block
+    const jsRegex = /```(?:javascript|js)\s*\n([\s\S]*?)\s*```/i;
+    const jsMatch = jsRegex.exec(text);
+    if (jsMatch && jsMatch[1].trim().length > 15 && !processedPaths.has('script.js')) {
+      tools.push({ type: 'WRITE_FILE', path: 'script.js', content: jsMatch[1].trim() });
+      processedPaths.add('script.js');
+    }
   }
 
   return tools;
@@ -33,35 +89,72 @@ export class VibeAgent {
     this.quotaMonitor = options.quotaMonitor;
     this.accountRouter = options.accountRouter;
     this.workspaceManager = options.workspaceManager;
+    this.usageTracker = options.usageTracker;
   }
 
   buildSystemPrompt(projectId) {
     const files = this.workspaceManager.listFiles(projectId);
     const fileList = files.map(f => f.path).join(', ') || 'No files yet';
 
-    return `You are BLACKBORZ AI, the premier autonomous vibe-coding engineering system.
-Your goal is to build full-scale, production-ready, beautiful, modern web applications for the user.
-NEVER generate demo placeholders, empty stubs, or fake comments. Always deliver complete, polished, high-performance code.
+    // Embed current contents of existing workspace files so the model knows what to edit
+    let filesContext = '';
+    for (const f of files.slice(0, 10)) {
+      if (f.isDir) continue;
+      try {
+        const content = this.workspaceManager.readFile(projectId, f.path);
+        if (content && content.length < 40000) {
+          filesContext += `\n--- FILE: ${f.path} ---\n${content}\n`;
+        }
+      } catch {}
+    }
 
-CURRENT WORKSPACE FILES:
+    return `Ты — BLACKBORZ AI, премиальный ИИ-ассистент для разработки и общих вопросов.
+Отвечай всегда на русском языке. Используй Markdown для форматирования ответов (заголовки, списки, блоки кода, жирный текст и т.д.).
+
+## Когда пользователь задаёт обычный вопрос:
+Отвечай развёрнуто и полезно. Не генерируй код, если не просят. Просто помогай.
+
+## Когда пользователь просит создать или изменить код:
+Ты пишешь код напрямую в файлы проекта (~/Downloads/<project>/).
+Цель — создавать полнофункциональные, production-ready, красивые, современные веб-приложения.
+НИКОГДА не генерируй демо-заглушки, пустые стабы или фейковые комментарии. Всегда пиши полный, рабочий код.
+
+ТЕКУЩИЕ ФАЙЛЫ ПРОЕКТА:
 ${fileList}
 
-TOOL USAGE FORMAT:
-When you need to create or edit a file, write:
-<<<TOOL:WRITE_FILE path="relative/path/to/file.ext">>>
-[complete production code here]
+СОДЕРЖИМОЕ ФАЙЛОВ:
+${filesContext || 'Нет файлов в проекте.'}
+
+### Формат для создания/редактирования файлов:
+Когда нужно создать или изменить ЛЮБОЙ файл, ОБЯЗАТЕЛЬНО используй этот формат:
+
+<<<TOOL:WRITE_FILE path="index.html">>>
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>App</title>
+</head>
+<body>
+  ...
+</body>
+</html>
 <<<END_TOOL>>>
 
-When you need to run a shell command in the project directory, write:
+Для выполнения shell-команд (например npm install):
 <<<TOOL:COMMAND>>>
 npm install package-name
 <<<END_TOOL>>>
 
-Always provide full, working code without placeholders.
-Explain your changes briefly in Russian.`;
+### Правила кодинга:
+1. Всегда пиши ПОЛНЫЙ, рабочий код внутри <<<TOOL:WRITE_FILE path="...">>>. Никогда не обрезай код.
+2. Можно создавать/обновлять несколько файлов за один ответ (index.html, style.css, script.js).
+3. Эстетика: глубокий чёрный #000, хромированные серебристые акценты, белая типографика, плавные анимации.
+4. Перед кодом и после него объясняй что сделал — на русском.
+5. Если вопрос НЕ про код — просто отвечай текстом, без генерации файлов.`;
   }
 
-  async run({ projectId, prompt, history = [], model = 'gemini-3.8-flash-high', onChunk, onTool, onStatus }) {
+  async run({ projectId, prompt, history = [], model = 'gemini-3.8-flash', onChunk, onTool, onStatus }) {
     const profiles = this.profileManager.listProfiles();
     const quotas = await this.quotaMonitor.getAllQuotas(profiles);
 
@@ -92,15 +185,6 @@ Explain your changes briefly in Russian.`;
         }
 
         const systemPrompt = this.buildSystemPrompt(projectId);
-        let historyContext = '';
-        if (Array.isArray(history) && history.length > 0) {
-          const recent = history.filter(m => (m.role === 'user' || m.role === 'assistant') && m.content).slice(-8);
-          if (recent.length > 0) {
-            historyContext = '\n\nPREVIOUS CONVERSATION HISTORY:\n' + 
-              recent.map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`).join('\n\n');
-          }
-        }
-        const fullPrompt = `${systemPrompt}${historyContext}\n\nUSER REQUEST:\n${prompt}`;
         const env = this.profileManager.getEnv(profile.id);
         const projectPath = this.workspaceManager.getProjectPath(projectId);
 
@@ -110,86 +194,138 @@ Explain your changes briefly in Russian.`;
                          !profile.apiKey.trim().startsWith('4/') && 
                          profile.apiKey.trim().length > 15;
 
-        let executionSuccess = false;
-
         if (isApiKey) {
-          try {
-            // Direct Google Gemini API streaming for profiles with API keys
-            const candidateModels = ['gemini-3.8-flash', 'gemini-3.8-flash-high', 'gemini-2.5-flash'];
-            let res = null;
-            let activeModel = candidateModels[0];
+          // Build conversation history in Gemini contents format
+          const formattedContents = [];
+          if (Array.isArray(history) && history.length > 0) {
+            const recent = history.filter(m => (m.role === 'user' || m.role === 'assistant') && m.content).slice(-8);
+            for (const m of recent) {
+              formattedContents.push({
+                role: m.role === 'user' ? 'user' : 'model',
+                parts: [{ text: m.content }]
+              });
+            }
+          }
+          formattedContents.push({
+            role: 'user',
+            parts: [{ text: prompt }]
+          });
 
-            for (const candModel of candidateModels) {
-              const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${candModel}:streamGenerateContent?alt=sse&key=${profile.apiKey}`;
-              const testRes = await fetch(apiUrl, {
+          // Models list: gemini-3.8-flash primary, then gemini-3-flash-preview, gemini-3.5-flash
+          const candidateModels = ['gemini-3.8-flash', 'gemini-3-flash-preview', 'gemini-3.5-flash'];
+          let apiSuccess = false;
+          let lastApiError = null;
+
+          for (const candModel of candidateModels) {
+            try {
+              // Try SSE Streaming first
+              const streamUrl = `https://generativelanguage.googleapis.com/v1beta/models/${candModel}:streamGenerateContent?alt=sse&key=${profile.apiKey}`;
+              const testRes = await fetch(streamUrl, {
                 method: 'POST',
                 headers: { 
                   'Content-Type': 'application/json',
                   'x-goog-api-key': profile.apiKey
                 },
                 body: JSON.stringify({
-                  contents: [{
-                    role: 'user',
-                    parts: [{ text: fullPrompt }]
-                  }]
+                  systemInstruction: {
+                    parts: [{ text: systemPrompt }]
+                  },
+                  contents: formattedContents,
+                  generationConfig: {
+                    temperature: 0.4,
+                    maxOutputTokens: 65536
+                  }
                 })
               });
 
               if (testRes.ok) {
-                res = testRes;
-                activeModel = candModel;
-                break;
-              } else if (testRes.status === 404) {
-                continue;
-              } else {
-                const errData = await testRes.json().catch(() => ({}));
-                console.warn(`[VibeAgent] Gemini API model ${candModel} returned ${testRes.status}: ${errData?.error?.message || testRes.statusText}`);
-              }
-            }
+                const reader = testRes.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
 
-            if (res && res.ok) {
-              const reader = res.body.getReader();
-              const decoder = new TextDecoder();
-              let buffer = '';
+                while (true) {
+                  const { done, value } = await reader.read();
+                  if (done) break;
+                  buffer += decoder.decode(value, { stream: true });
+                  const lines = buffer.split('\n');
+                  buffer = lines.pop() || '';
 
-              while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                buffer += decoder.decode(value, { stream: true });
-                const lines = buffer.split('\n');
-                buffer = lines.pop() || '';
-
-                for (const line of lines) {
-                  if (line.startsWith('data: ')) {
-                    try {
-                      const chunkJson = JSON.parse(line.slice(6));
-                      const parts = chunkJson.candidates?.[0]?.content?.parts || [];
-                      const chunkText = parts.map(p => p.text || '').join('');
-                      if (chunkText) {
-                        resultText += chunkText;
-                        if (onChunk) onChunk(chunkText);
-                      }
-                    } catch {}
+                  for (const rawLine of lines) {
+                    const line = rawLine.trim();
+                    if (line.startsWith('data:')) {
+                      try {
+                        const jsonStr = line.replace(/^data:\s*/, '');
+                        if (!jsonStr) continue;
+                        const chunkJson = JSON.parse(jsonStr);
+                        const parts = chunkJson.candidates?.[0]?.content?.parts || [];
+                        for (const p of parts) {
+                          const chunkText = p.text || '';
+                          if (chunkText) {
+                            resultText += chunkText;
+                            if (onChunk) onChunk(chunkText);
+                          }
+                        }
+                      } catch {}
+                    }
                   }
+                }
+
+                if (resultText && resultText.trim()) {
+                  apiSuccess = true;
+                  break;
                 }
               }
 
-              if (resultText && resultText.trim()) {
-                executionSuccess = true;
-              }
-            }
-          } catch (apiErr) {
-            console.warn(`[VibeAgent] Direct Gemini API failed: ${apiErr.message}. Falling back to Antigravity CLI...`);
-          }
-        }
+              // Fallback to non-streaming if stream was empty or failed
+              const genUrl = `https://generativelanguage.googleapis.com/v1beta/models/${candModel}:generateContent?key=${profile.apiKey}`;
+              const genRes = await fetch(genUrl, {
+                method: 'POST',
+                headers: { 
+                  'Content-Type': 'application/json',
+                  'x-goog-api-key': profile.apiKey
+                },
+                body: JSON.stringify({
+                  systemInstruction: {
+                    parts: [{ text: systemPrompt }]
+                  },
+                  contents: formattedContents,
+                  generationConfig: {
+                    temperature: 0.4,
+                    maxOutputTokens: 65536
+                  }
+                })
+              });
 
-        // If direct API was not used or did not produce output, execute via Antigravity CLI
-        if (!executionSuccess) {
+              if (genRes.ok) {
+                const genData = await genRes.json();
+                const parts = genData.candidates?.[0]?.content?.parts || [];
+                const fullGenText = parts.map(p => p.text || '').join('');
+                if (fullGenText && fullGenText.trim()) {
+                  resultText = fullGenText;
+                  if (onChunk) onChunk(fullGenText);
+                  apiSuccess = true;
+                  break;
+                }
+              } else {
+                const errData = await genRes.json().catch(() => ({}));
+                lastApiError = new Error(`Google API ${candModel} returned ${genRes.status}: ${errData?.error?.message || genRes.statusText}`);
+              }
+            } catch (err) {
+              lastApiError = err;
+            }
+          }
+
+          if (!apiSuccess || !resultText.trim()) {
+            // Throw error to trigger AccountRouter failover to next Google account!
+            throw lastApiError || new Error(`Google Gemini API error on ${profile.name}. Triggering failover...`);
+          }
+        } else {
+          // Antigravity CLI Execution
           resultText = await new Promise((resolve, reject) => {
             let output = '';
             let errOutput = '';
 
-            const child = spawn(AGY_BIN, ['-p', fullPrompt, '--model', 'gemini-3.8-flash-high'], {
+            const child = spawn(AGY_BIN, ['-p', `${systemPrompt}\n\nUSER REQUEST:\n${prompt}`, '--model', 'gemini-3.8-flash-high'], {
               cwd: projectPath,
               env,
               stdio: ['ignore', 'pipe', 'pipe']
@@ -246,7 +382,45 @@ Explain your changes briefly in Russian.`;
                 updated: tool.content
               });
             }
+          } else if (tool.type === 'COMMAND') {
+            try {
+              const { exec } = await import('node:child_process');
+              const { promisify } = await import('node:util');
+              const execAsync = promisify(exec);
+              const { stdout, stderr } = await execAsync(tool.command, { cwd: projectPath, timeout: 30000 });
+              appliedChanges.push({
+                type: 'command_executed',
+                command: tool.command,
+                output: stdout || stderr
+              });
+              if (onTool) {
+                onTool({
+                  tool: 'COMMAND',
+                  command: tool.command,
+                  output: stdout || stderr
+                });
+              }
+            } catch (cmdErr) {
+              appliedChanges.push({
+                type: 'command_failed',
+                command: tool.command,
+                error: cmdErr.message
+              });
+              if (onTool) {
+                onTool({
+                  tool: 'COMMAND',
+                  command: tool.command,
+                  error: cmdErr.message
+                });
+              }
+            }
           }
+        }
+
+        // Record usage for this profile
+        if (this.usageTracker) {
+          const estimatedTokens = Math.round(resultText.length / 4); // rough estimate: 1 token ≈ 4 chars
+          this.usageTracker.recordRequest(profile.id, { tokensUsed: estimatedTokens, model: model || 'gemini-3.8-flash' });
         }
 
         return {

@@ -1,6 +1,11 @@
 export class AccountRouter {
   constructor(options = {}) {
     this.coolDowns = new Map(); // profileId -> timestamp until which it's cooling down
+    this.lastUsedProfileId = null;
+  }
+
+  getLastUsedProfileId() {
+    return this.lastUsedProfileId;
   }
 
   isCoolingDown(profileId) {
@@ -81,6 +86,7 @@ export class AccountRouter {
       const profile = ranked[i];
       try {
         const result = await runner(profile);
+        this.lastUsedProfileId = profile.id;
         return result;
       } catch (err) {
         lastError = err;

@@ -5,6 +5,7 @@ import { ChatPanel } from './components/ChatPanel.tsx';
 import { ProjectFilesDrawer } from './components/ProjectFilesDrawer.tsx';
 import { AccountPoolModal } from './components/AccountPoolModal.tsx';
 import { GitHubModal } from './components/GitHubModal.tsx';
+import { CreateProjectModal } from './components/CreateProjectModal.tsx';
 import { Agentation } from 'agentation';
 
 export default function App() {
@@ -22,6 +23,7 @@ export default function App() {
   const [isFilesDrawerOpen, setIsFilesDrawerOpen] = useState(false);
   const [isPoolModalOpen, setIsPoolModalOpen] = useState(false);
   const [isGitModalOpen, setIsGitModalOpen] = useState(false);
+  const [isCreateProjectModalOpen, setIsCreateProjectModalOpen] = useState(false);
   const [isCommitting, setIsCommitting] = useState(false);
 
   // Chat State
@@ -85,11 +87,22 @@ export default function App() {
     fetchGitStatus(project.id);
     startDevServer(project.id);
 
-    // Restore saved chat history for this project
+    // Restore saved chat history for this project (with validation)
     try {
       const saved = localStorage.getItem(`blackborz_chat_${project.id}`);
       if (saved) {
-        setMessages(JSON.parse(saved));
+        const parsed = JSON.parse(saved);
+        // Validate: must be array, each item must have role and content
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          const valid = parsed.filter(m => 
+            m && typeof m === 'object' && 
+            (m.role === 'user' || m.role === 'assistant' || m.role === 'system') &&
+            typeof m.content === 'string'
+          );
+          setMessages(valid);
+        } else {
+          setMessages([]);
+        }
       } else {
         setMessages([]);
       }
@@ -116,9 +129,11 @@ export default function App() {
     }
   };
 
-  const handleCreateNewProject = async () => {
-    const name = prompt('Введите название нового проекта или диалога:', `project-${Date.now().toString().slice(-4)}`);
-    if (!name || !name.trim()) return;
+  const handleCreateNewProject = () => {
+    setIsCreateProjectModalOpen(true);
+  };
+
+  const handleConfirmCreateProject = async (name) => {
     try {
       const res = await fetch('/api/projects', {
         method: 'POST',
@@ -126,11 +141,36 @@ export default function App() {
         body: JSON.stringify({ name: name.trim(), template: 'vanilla-html' })
       });
       const newProj = await res.json();
-      setProjects(prev => [...prev, newProj]);
+      setProjects(prev => [newProj, ...prev.filter(p => p.id !== newProj.id)]);
       selectProject(newProj);
       setMessages([]);
     } catch (e) {
       console.error('Failed to create new project', e);
+      throw e;
+    }
+  };
+
+  const handleDeleteProject = async (projectId, e) => {
+    if (e) e.stopPropagation();
+    if (!window.confirm(`Удалить проект "${projectId}" и связанную папку из Загрузок?`)) {
+      return;
+    }
+    try {
+      await fetch(`/api/projects/${projectId}`, { method: 'DELETE' });
+      const updated = projects.filter(p => p.id !== projectId);
+      setProjects(updated);
+      try {
+        localStorage.removeItem(`blackborz_chat_${projectId}`);
+      } catch {}
+      if (currentProject?.id === projectId) {
+        if (updated.length > 0) {
+          selectProject(updated[0]);
+        } else {
+          createStarterProject();
+        }
+      }
+    } catch (e) {
+      console.error('Failed to delete project', e);
     }
   };
 
@@ -289,7 +329,26 @@ export default function App() {
         // Refresh project files and git status
         fetchProjectFiles(currentProject.id);
         fetchGitStatus(currentProject.id);
-      } else if (data.type === 'done' || data.type === 'error') {
+      } else if (data.type === 'error') {
+        setIsGenerating(false);
+        setMessages(prev => {
+          if (prev.length === 0) return prev;
+          const lastIdx = prev.length - 1;
+          const last = prev[lastIdx];
+          if (!last || last.role !== 'assistant') return prev;
+          return [
+            ...prev.slice(0, lastIdx),
+            {
+              ...last,
+              content: last.content 
+                ? `${last.content}\n\n⚠️ ${data.message || 'Ошибка при генерации ответа'}` 
+                : `⚠️ Ошибка: ${data.message || 'Не удалось получить ответ от Google AI.'}`
+            }
+          ];
+        });
+        fetchProfiles();
+        ws.close();
+      } else if (data.type === 'done') {
         setIsGenerating(false);
         fetchProfiles(); // update quotas
         ws.close();
@@ -299,6 +358,19 @@ export default function App() {
     ws.onerror = (e) => {
       console.error('WebSocket error', e);
       setIsGenerating(false);
+      setMessages(prev => {
+        if (prev.length === 0) return prev;
+        const lastIdx = prev.length - 1;
+        const last = prev[lastIdx];
+        if (!last || last.role !== 'assistant') return prev;
+        if (!last.content) {
+          return [
+            ...prev.slice(0, lastIdx),
+            { ...last, content: '⚠️ Ошибка подключения к серверу BLACKBORZ AI.' }
+          ];
+        }
+        return prev;
+      });
     };
   };
 
@@ -340,6 +412,7 @@ export default function App() {
           currentProject={currentProject}
           onSelectProject={selectProject}
           onCreateProject={handleCreateNewProject}
+          onDeleteProject={handleDeleteProject}
           profiles={profiles}
           onOpenPoolModal={() => setIsPoolModalOpen(true)}
           onOpenGitModal={() => setIsGitModalOpen(true)}
@@ -357,14 +430,8 @@ export default function App() {
           currentProject={currentProject}
           profiles={profiles}
           onOpenPoolModal={() => setIsPoolModalOpen(true)}
-          onOpenGitModal={() => setIsGitModalOpen(true)}
-          onCommitPush={() => setIsGitModalOpen(true)}
-          isCommitting={isCommitting}
-          gitStatus={gitStatus}
           onClearChat={handleClearChat}
-          selectedModel={selectedModel}
           activeAccountNotice={activeAccountNotice}
-          previewUrl={previewUrl}
         />
 
         {/* Full-Width Working Chat Area */}
@@ -373,6 +440,8 @@ export default function App() {
           onSendMessage={handleSendMessage}
           isGenerating={isGenerating}
           activeAccountNotice={activeAccountNotice}
+          selectedModel={selectedModel}
+          onModelChange={setSelectedModel}
         />
       </div>
 
@@ -405,6 +474,13 @@ export default function App() {
         gitStatus={gitStatus}
         onCommitPush={handleCommitPush}
         isCommitting={isCommitting}
+      />
+
+      {/* Create Project Modal */}
+      <CreateProjectModal
+        isOpen={isCreateProjectModalOpen}
+        onClose={() => setIsCreateProjectModalOpen(false)}
+        onCreate={handleConfirmCreateProject}
       />
 
       {/* Agentation Visual Feedback & Annotation Toolbar */}
