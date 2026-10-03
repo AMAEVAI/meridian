@@ -5,6 +5,7 @@ import { ChatPanel } from './components/ChatPanel.tsx';
 import { ProjectFilesDrawer } from './components/ProjectFilesDrawer.tsx';
 import { AccountPoolModal } from './components/AccountPoolModal.tsx';
 import { GitHubModal } from './components/GitHubModal.tsx';
+import { Agentation } from 'agentation';
 
 export default function App() {
   const [projects, setProjects] = useState([]);
@@ -404,6 +405,16 @@ export default function App() {
         gitStatus={gitStatus}
         onCommitPush={handleCommitPush}
         isCommitting={isCommitting}
+      />
+
+      {/* Agentation Visual Feedback & Annotation Toolbar */}
+      <Agentation
+        appName="BLACKBORZ AI"
+        onSubmit={(output) => {
+          if (output && output.trim()) {
+            handleSendMessage(output);
+          }
+        }}
       />
     </div>
   );
