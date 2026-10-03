@@ -310,7 +310,8 @@ export default function App() {
         onClose={() => setIsPoolModalOpen(false)}
         profiles={profiles}
         onToggleProfile={handleToggleProfile}
-        onAuthProfile={handleAuthProfile}
+        onUpdateProfile={fetchProfiles}
+        onResetProfile={fetchProfiles}
       />
 
       <GitHubModal

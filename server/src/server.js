@@ -58,13 +58,52 @@ export function createServer() {
     }
   });
 
-  app.post('/api/profiles/:id/auth', (req, res) => {
+  app.put('/api/profiles/:id', (req, res) => {
     try {
       const { id } = req.params;
-      if (id === 'profile_1') {
-        return res.json({ success: true, message: 'Profile 1 is your primary active Google account and is already authenticated!' });
-      }
-      res.json({ success: true, message: `To connect profile ${id}, please run in terminal: agy --config-dir ~/.meridian-studio/profiles/${id}` });
+      const { name, email, apiKey, authType, isActive } = req.body;
+      const updated = profileManager.updateProfile(id, {
+        ...(name !== undefined && { name }),
+        ...(email !== undefined && { email }),
+        ...(apiKey !== undefined && { apiKey }),
+        ...(authType !== undefined && { authType }),
+        ...(isActive !== undefined && { isActive })
+      });
+      res.json({ success: true, profile: updated });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/profiles/:id/test', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const profile = profileManager.getProfile(id);
+      if (!profile) return res.status(404).json({ error: 'Profile not found' });
+
+      // Run quick model check with this profile
+      const env = profileManager.getEnv(id);
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const execFileAsync = promisify(execFile);
+
+      const { stdout } = await execFileAsync(AGY_BIN, ['models'], {
+        env,
+        timeout: 10000
+      });
+
+      profileManager.updateProfile(id, { status: 'ready' });
+      res.json({ success: true, message: 'Account connected and verified successfully!' });
+    } catch (err) {
+      res.status(400).json({ error: `Connection test failed: ${err.message}` });
+    }
+  });
+
+  app.post('/api/profiles/:id/reset', (req, res) => {
+    try {
+      const { id } = req.params;
+      const reset = profileManager.resetProfile(id);
+      res.json({ success: true, profile: reset });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }

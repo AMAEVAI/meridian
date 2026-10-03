@@ -1,6 +1,5 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
 import { PROFILES_DIR, NUM_SLOTS } from '../config.js';
 
 export class ProfileManager {
@@ -33,7 +32,7 @@ export class ProfileManager {
       fs.mkdirSync(configDir, { recursive: true });
     }
 
-    // Ensure settings.json prevents accidental paid overage
+    // Default settings.json
     const settingsPath = path.join(cliDir, 'settings.json');
     if (!fs.existsSync(settingsPath)) {
       const defaultSettings = {
@@ -45,15 +44,17 @@ export class ProfileManager {
       fs.writeFileSync(settingsPath, JSON.stringify(defaultSettings, null, 2), 'utf8');
     }
 
-    // Ensure metadata.json
+    // Default metadata.json
     const metaPath = path.join(profileDir, 'metadata.json');
     if (!fs.existsSync(metaPath)) {
       const isPrimary = index === 1;
       const defaultMeta = {
         id,
         index,
-        name: isPrimary ? 'Primary Account (yataev91@gmail.com)' : `Google Profile #${index}`,
-        email: isPrimary ? 'yataev91@gmail.com' : null,
+        name: isPrimary ? 'Основной аккаунт' : `Google Аккаунт #${index}`,
+        email: isPrimary ? 'yataev91@gmail.com' : '',
+        authType: isPrimary ? 'system' : 'api_key', // 'system' | 'api_key' | 'oauth'
+        apiKey: '',
         isActive: true,
         status: isPrimary ? 'ready' : 'unconfigured',
         isPrimary,
@@ -73,7 +74,14 @@ export class ProfileManager {
       if (fs.existsSync(metaPath)) {
         try {
           const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
-          list.push({ ...meta, path: profileDir });
+          // Mask API key in public list for security
+          const maskedKey = meta.apiKey ? `${meta.apiKey.slice(0, 6)}...${meta.apiKey.slice(-4)}` : '';
+          list.push({ 
+            ...meta, 
+            hasApiKey: Boolean(meta.apiKey),
+            apiKeyMasked: maskedKey,
+            path: profileDir 
+          });
         } catch {
           list.push({ id, index: i, name: `Account #${i}`, isActive: true, status: 'unconfigured', path: profileDir });
         }
@@ -83,7 +91,17 @@ export class ProfileManager {
   }
 
   getProfile(id) {
-    return this.listProfiles().find(p => p.id === id) || null;
+    const profileDir = path.join(this.baseDir, id);
+    const metaPath = path.join(profileDir, 'metadata.json');
+    if (fs.existsSync(metaPath)) {
+      try {
+        const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+        return { ...meta, path: profileDir };
+      } catch {
+        return null;
+      }
+    }
+    return null;
   }
 
   updateProfile(id, updates) {
@@ -99,27 +117,60 @@ export class ProfileManager {
       ...updates,
       updatedAt: new Date().toISOString()
     };
+
+    // If API key is provided, configure settings.json for gemini model provider
+    const cliSettingsPath = path.join(profileDir, 'antigravity-cli', 'settings.json');
+    if (updated.authType === 'api_key' && updated.apiKey) {
+      updated.status = 'ready';
+      if (fs.existsSync(cliSettingsPath)) {
+        try {
+          const s = JSON.parse(fs.readFileSync(cliSettingsPath, 'utf8'));
+          s.modelProvider = 'gemini';
+          fs.writeFileSync(cliSettingsPath, JSON.stringify(s, null, 2), 'utf8');
+        } catch {}
+      }
+    } else if (updated.authType === 'system' || updated.isPrimary) {
+      updated.status = 'ready';
+    }
+
     fs.writeFileSync(metaPath, JSON.stringify(updated, null, 2), 'utf8');
     return updated;
+  }
+
+  resetProfile(id) {
+    const profile = this.getProfile(id);
+    if (!profile) return false;
+    if (profile.isPrimary) return false; // don't reset primary account
+
+    return this.updateProfile(id, {
+      name: `Google Аккаунт #${profile.index}`,
+      email: '',
+      authType: 'api_key',
+      apiKey: '',
+      status: 'unconfigured',
+      isActive: true
+    });
   }
 
   getEnv(id) {
     const profile = this.getProfile(id);
     if (!profile) throw new Error(`Profile ${id} not found`);
 
-    // Profile 1 uses the default primary user environment (which is already signed in!)
     if (profile.isPrimary || id === 'profile_1') {
-      return {
-        ...process.env
-      };
+      return { ...process.env };
     }
 
-    // Secondary profiles use isolated directory
-    return {
+    const env = {
       ...process.env,
       HOME: profile.path,
       AGY_HOME: profile.path,
       GEMINI_CLI_HOME: profile.path
     };
+
+    if (profile.authType === 'api_key' && profile.apiKey) {
+      env.GEMINI_API_KEY = profile.apiKey;
+    }
+
+    return env;
   }
 }
