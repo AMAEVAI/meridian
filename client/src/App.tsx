@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { Sidebar } from './components/Sidebar.tsx';
 import { Header } from './components/Header.tsx';
 import { ChatPanel } from './components/ChatPanel.tsx';
-import { PreviewPanel } from './components/PreviewPanel.tsx';
+import { ProjectFilesDrawer } from './components/ProjectFilesDrawer.tsx';
 import { AccountPoolModal } from './components/AccountPoolModal.tsx';
 import { GitHubModal } from './components/GitHubModal.tsx';
 
@@ -15,7 +16,9 @@ export default function App() {
   const [selectedFile, setSelectedFile] = useState('index.html');
   const [fileContent, setFileContent] = useState('');
 
-  // Modals
+  // UI State
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [isFilesDrawerOpen, setIsFilesDrawerOpen] = useState(false);
   const [isPoolModalOpen, setIsPoolModalOpen] = useState(false);
   const [isGitModalOpen, setIsGitModalOpen] = useState(false);
   const [isCommitting, setIsCommitting] = useState(false);
@@ -53,7 +56,6 @@ export default function App() {
         setProjects(data.projects);
         selectProject(data.projects[0]);
       } else {
-        // Create initial starter project
         createStarterProject();
       }
     } catch (e) {
@@ -81,6 +83,54 @@ export default function App() {
     fetchProjectFiles(project.id);
     fetchGitStatus(project.id);
     startDevServer(project.id);
+
+    // Restore saved chat history for this project
+    try {
+      const saved = localStorage.getItem(`blackborz_chat_${project.id}`);
+      if (saved) {
+        setMessages(JSON.parse(saved));
+      } else {
+        setMessages([]);
+      }
+    } catch {
+      setMessages([]);
+    }
+  };
+
+  // Save chat history to localStorage whenever messages update
+  useEffect(() => {
+    if (currentProject?.id && messages.length > 0) {
+      try {
+        localStorage.setItem(`blackborz_chat_${currentProject.id}`, JSON.stringify(messages));
+      } catch {}
+    }
+  }, [messages, currentProject?.id]);
+
+  const handleClearChat = () => {
+    setMessages([]);
+    if (currentProject?.id) {
+      try {
+        localStorage.removeItem(`blackborz_chat_${currentProject.id}`);
+      } catch {}
+    }
+  };
+
+  const handleCreateNewProject = async () => {
+    const name = prompt('Введите название нового проекта или диалога:', `project-${Date.now().toString().slice(-4)}`);
+    if (!name || !name.trim()) return;
+    try {
+      const res = await fetch('/api/projects', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name.trim(), template: 'vanilla-html' })
+      });
+      const newProj = await res.json();
+      setProjects(prev => [...prev, newProj]);
+      selectProject(newProj);
+      setMessages([]);
+    } catch (e) {
+      console.error('Failed to create new project', e);
+    }
   };
 
   const fetchProjectFiles = async (projectId) => {
@@ -89,7 +139,6 @@ export default function App() {
       const data = await res.json();
       if (data.files) {
         setFiles(data.files);
-        // Load default file content
         const target = data.files.find(f => f.path === 'index.html') || data.files[0];
         if (target) {
           loadFileContent(projectId, target.path);
@@ -150,6 +199,12 @@ export default function App() {
   const handleSendMessage = (text) => {
     if (!currentProject) return;
 
+    if (wsRef.current) {
+      try {
+        wsRef.current.close();
+      } catch {}
+    }
+
     // Add user message
     const userMsg = { role: 'user', content: text };
     const assistantMsg = { role: 'assistant', content: '', tools: [] };
@@ -167,6 +222,7 @@ export default function App() {
         type: 'prompt',
         projectId: currentProject.id,
         prompt: text,
+        history: messages,
         model: selectedModel
       }));
     };
@@ -174,25 +230,60 @@ export default function App() {
     ws.onmessage = (event) => {
       const data = JSON.parse(event.data);
 
-      if (data.type === 'status') {
-        setActiveAccountNotice(`${data.profileName} (Auto-Balanced)`);
+      if (data.type === 'failover') {
+        const nextTarget = data.nextEmail || data.nextProfileId || 'следующий аккаунт';
+        setActiveAccountNotice(`⚡ Лимит исчерпан: переключено на ${nextTarget}`);
+        setMessages(prev => {
+          if (prev.length === 0) return prev;
+          const lastIdx = prev.length - 1;
+          const last = prev[lastIdx];
+          const historyBefore = last && last.role === 'assistant' ? prev.slice(0, lastIdx) : prev;
+          const currentAssistant = last && last.role === 'assistant'
+            ? { ...last, content: '', tools: [] }
+            : { role: 'assistant', content: '', tools: [] };
+
+          return [
+            ...historyBefore,
+            {
+              role: 'system',
+              content: `⚡ ${data.message || `5-часовой лимит исчерпан. Автоматически переключено на следующий аккаунт: ${nextTarget}`}`
+            },
+            currentAssistant
+          ];
+        });
+        fetchProfiles();
+      } else if (data.type === 'status') {
+        setActiveAccountNotice(`${data.profileName || data.profileId} (Active)`);
       } else if (data.type === 'chunk') {
         setMessages(prev => {
-          const next = [...prev];
-          const last = next[next.length - 1];
-          if (last && last.role === 'assistant') {
-            last.content += data.chunk;
-          }
-          return next;
+          if (prev.length === 0) return prev;
+          const lastIdx = prev.length - 1;
+          const last = prev[lastIdx];
+          if (!last || last.role !== 'assistant') return prev;
+
+          // Pure immutable update without mutating `last` in place
+          return [
+            ...prev.slice(0, lastIdx),
+            {
+              ...last,
+              content: (last.content || '') + data.chunk
+            }
+          ];
         });
       } else if (data.type === 'tool') {
         setMessages(prev => {
-          const next = [...prev];
-          const last = next[next.length - 1];
-          if (last && last.role === 'assistant') {
-            last.tools = [...(last.tools || []), data];
-          }
-          return next;
+          if (prev.length === 0) return prev;
+          const lastIdx = prev.length - 1;
+          const last = prev[lastIdx];
+          if (!last || last.role !== 'assistant') return prev;
+
+          return [
+            ...prev.slice(0, lastIdx),
+            {
+              ...last,
+              tools: [...(last.tools || []), data]
+            }
+          ];
         });
         // Refresh project files and git status
         fetchProjectFiles(currentProject.id);
@@ -220,16 +311,6 @@ export default function App() {
     }
   };
 
-  const handleAuthProfile = async (profileId) => {
-    try {
-      await fetch(`/api/profiles/${profileId}/auth`, { method: 'POST' });
-      alert(`Authentication initiated for ${profileId}. Please complete Google sign-in if your browser prompts you.`);
-      fetchProfiles();
-    } catch (e) {
-      console.error('Failed to auth profile', e);
-    }
-  };
-
   // 5. Commit & Push
   const handleCommitPush = async (commitData) => {
     if (!currentProject) return;
@@ -250,59 +331,61 @@ export default function App() {
   };
 
   return (
-    <div className="flex flex-col h-screen w-screen overflow-hidden bg-slate-950 text-slate-100">
-      <Header
-        projects={projects}
-        currentProject={currentProject}
-        onSelectProject={selectProject}
-        onCreateProject={() => {
-          const name = prompt('Enter project name:', 'new-vibe-project');
-          if (name) {
-            fetch('/api/projects', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ name, template: 'vanilla-html' })
-            }).then(r => r.json()).then(p => {
-              setProjects(prev => [...prev, p]);
-              selectProject(p);
-            });
-          }
-        }}
-        profiles={profiles}
-        onOpenPoolModal={() => setIsPoolModalOpen(true)}
-        onOpenGitModal={() => setIsGitModalOpen(true)}
-        onCommitPush={() => setIsGitModalOpen(true)}
-        isCommitting={isCommitting}
-        gitStatus={gitStatus}
-      />
+    <div className="flex h-screen w-screen overflow-hidden bg-black text-white selection:bg-white selection:text-black">
+      {/* Left Full Sidebar Menu (like ChatGPT) */}
+      {isSidebarOpen && (
+        <Sidebar
+          projects={projects}
+          currentProject={currentProject}
+          onSelectProject={selectProject}
+          onCreateProject={handleCreateNewProject}
+          profiles={profiles}
+          onOpenPoolModal={() => setIsPoolModalOpen(true)}
+          onOpenGitModal={() => setIsGitModalOpen(true)}
+          onOpenFilesDrawer={() => setIsFilesDrawerOpen(true)}
+          previewUrl={previewUrl}
+          filesCount={files.length}
+        />
+      )}
 
-      {/* Split-Screen Workspace */}
-      <div className="flex-1 flex overflow-hidden">
-        {/* Left Side: Vibe-Coding Agent Chat (45% width) */}
-        <div className="w-[45%] h-full shrink-0">
-          <ChatPanel
-            messages={messages}
-            onSendMessage={handleSendMessage}
-            isGenerating={isGenerating}
-            activeAccountNotice={activeAccountNotice}
-            selectedModel={selectedModel}
-            onSelectModel={setSelectedModel}
-          />
-        </div>
+      {/* Main Right Area: Top Settings Header + Working Chat */}
+      <div className="flex-1 flex flex-col h-full overflow-hidden bg-black relative">
+        <Header
+          isSidebarOpen={isSidebarOpen}
+          onToggleSidebar={() => setIsSidebarOpen(prev => !prev)}
+          currentProject={currentProject}
+          profiles={profiles}
+          onOpenPoolModal={() => setIsPoolModalOpen(true)}
+          onOpenGitModal={() => setIsGitModalOpen(true)}
+          onCommitPush={() => setIsGitModalOpen(true)}
+          isCommitting={isCommitting}
+          gitStatus={gitStatus}
+          onClearChat={handleClearChat}
+          selectedModel={selectedModel}
+          activeAccountNotice={activeAccountNotice}
+          previewUrl={previewUrl}
+        />
 
-        {/* Right Side: Live App Preview & Code Viewer (55% width) */}
-        <div className="flex-1 h-full overflow-hidden">
-          <PreviewPanel
-            previewUrl={previewUrl}
-            onStartDevServer={() => currentProject && startDevServer(currentProject.id)}
-            files={files}
-            selectedFile={selectedFile}
-            onSelectFile={(f) => currentProject && loadFileContent(currentProject.id, f)}
-            fileContent={fileContent}
-            onSaveFileContent={saveFileContent}
-          />
-        </div>
+        {/* Full-Width Working Chat Area */}
+        <ChatPanel
+          messages={messages}
+          onSendMessage={handleSendMessage}
+          isGenerating={isGenerating}
+          activeAccountNotice={activeAccountNotice}
+        />
       </div>
+
+      {/* Slide-Over Project Files Drawer */}
+      <ProjectFilesDrawer
+        isOpen={isFilesDrawerOpen}
+        onClose={() => setIsFilesDrawerOpen(false)}
+        files={files}
+        selectedFile={selectedFile}
+        onSelectFile={(f) => loadFileContent(currentProject?.id, f)}
+        fileContent={fileContent}
+        onSaveFileContent={saveFileContent}
+        previewUrl={previewUrl}
+      />
 
       {/* Modals */}
       <AccountPoolModal

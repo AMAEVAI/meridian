@@ -7,8 +7,8 @@ const ROOT = path.resolve(__dirname, '..');
 
 console.log('⚡ Starting Meridian Studio (Multi-Account Antigravity Vibe-Coding Platform)...');
 
-// 1. Start Server on port 4000
-const server = spawn('node', ['server/src/server.js'], {
+// 1. Start Server on port 4000 (with auto-watch)
+const server = spawn('node', ['--watch', 'server/src/server.js'], {
   cwd: ROOT,
   stdio: 'inherit',
   env: { ...process.env, PORT: '4000' }

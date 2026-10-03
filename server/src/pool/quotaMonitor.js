@@ -20,15 +20,17 @@ export class QuotaMonitor {
       return cached.quota;
     }
 
-    // Safety guard: only fetch quota if profile is ready/primary.
-    // NEVER execute agy on unconfigured or unverified profiles to avoid triggering browser login!
-    if (profile.status !== 'ready' && !profile.isPrimary && profile.id !== 'profile_1') {
+    // Safety guard: NEVER run agy -p /usage on profiles with api_key!
+    // agy -p /usage requires Google OAuth tokens and triggers browser popups if executed without OAuth!
+    if (profile.hasApiKey || profile.authType === 'api_key' || !profile.isPrimary) {
       const fallback = {
-        gemini5h: 0,
-        geminiWeekly: 0,
+        gemini5h: profile.hasApiKey ? 0.05 : 0,
+        geminiWeekly: profile.hasApiKey ? 0.10 : 0,
         other5h: 0,
         otherWeekly: 0,
-        status: 'unconfigured'
+        status: profile.hasApiKey ? 'ready' : 'unconfigured',
+        type: profile.hasApiKey ? 'api_key' : 'unconfigured',
+        fetchedAt: now
       };
       this.cache.set(profile.id, { quota: fallback, timestamp: now });
       return fallback;

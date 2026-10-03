@@ -39,8 +39,9 @@ export class VibeAgent {
     const files = this.workspaceManager.listFiles(projectId);
     const fileList = files.map(f => f.path).join(', ') || 'No files yet';
 
-    return `You are the Meridian Antigravity Vibe-Coding Agent.
-Your goal is to build beautiful, functional, and modern web applications for the user.
+    return `You are BLACKBORZ AI, the premier autonomous vibe-coding engineering system.
+Your goal is to build full-scale, production-ready, beautiful, modern web applications for the user.
+NEVER generate demo placeholders, empty stubs, or fake comments. Always deliver complete, polished, high-performance code.
 
 CURRENT WORKSPACE FILES:
 ${fileList}
@@ -48,7 +49,7 @@ ${fileList}
 TOOL USAGE FORMAT:
 When you need to create or edit a file, write:
 <<<TOOL:WRITE_FILE path="relative/path/to/file.ext">>>
-[complete code here]
+[complete production code here]
 <<<END_TOOL>>>
 
 When you need to run a shell command in the project directory, write:
@@ -57,61 +58,164 @@ npm install package-name
 <<<END_TOOL>>>
 
 Always provide full, working code without placeholders.
-Explain your changes briefly before or after tool blocks.`;
+Explain your changes briefly in Russian.`;
   }
 
-  async run({ projectId, prompt, model = 'gemini-3.8-flash-high', onChunk, onTool, onStatus }) {
+  async run({ projectId, prompt, history = [], model = 'gemini-3.8-flash-high', onChunk, onTool, onStatus }) {
     const profiles = this.profileManager.listProfiles();
     const quotas = await this.quotaMonitor.getAllQuotas(profiles);
 
     return await this.accountRouter.executeWithFailover({
       profiles,
       quotas,
+      onFailover: ({ exhaustedProfile, nextProfile, message }) => {
+        if (onStatus) {
+          onStatus({
+            type: 'failover',
+            message,
+            exhaustedProfileId: exhaustedProfile.id,
+            nextProfileId: nextProfile.id,
+            exhaustedEmail: exhaustedProfile.email,
+            nextEmail: nextProfile.email
+          });
+        }
+      },
       runner: async (profile) => {
         if (onStatus) {
           onStatus({
             type: 'status',
-            message: `Executing with ${profile.name} (${profile.id})...`,
+            message: `Executing with ${profile.name} (${profile.email || profile.id})...`,
             profileId: profile.id,
-            profileName: profile.name
+            profileName: profile.name,
+            email: profile.email
           });
         }
 
         const systemPrompt = this.buildSystemPrompt(projectId);
-        const fullPrompt = `${systemPrompt}\n\nUSER REQUEST:\n${prompt}`;
+        let historyContext = '';
+        if (Array.isArray(history) && history.length > 0) {
+          const recent = history.filter(m => (m.role === 'user' || m.role === 'assistant') && m.content).slice(-8);
+          if (recent.length > 0) {
+            historyContext = '\n\nPREVIOUS CONVERSATION HISTORY:\n' + 
+              recent.map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`).join('\n\n');
+          }
+        }
+        const fullPrompt = `${systemPrompt}${historyContext}\n\nUSER REQUEST:\n${prompt}`;
         const env = this.profileManager.getEnv(profile.id);
         const projectPath = this.workspaceManager.getProjectPath(projectId);
 
-        const resultText = await new Promise((resolve, reject) => {
-          let output = '';
-          let errOutput = '';
+        let resultText = '';
 
-          const child = spawn(AGY_BIN, ['-p', fullPrompt, '--model', model], {
-            cwd: projectPath,
-            env,
-            stdio: ['ignore', 'pipe', 'pipe']
-          });
+        const isApiKey = profile.apiKey && 
+                         !profile.apiKey.trim().startsWith('4/') && 
+                         profile.apiKey.trim().length > 15;
 
-          child.stdout.on('data', chunk => {
-            const str = chunk.toString();
-            output += str;
-            if (onChunk) onChunk(str);
-          });
+        let executionSuccess = false;
 
-          child.stderr.on('data', chunk => {
-            errOutput += chunk.toString();
-          });
+        if (isApiKey) {
+          try {
+            // Direct Google Gemini API streaming for profiles with API keys
+            const candidateModels = ['gemini-3.8-flash', 'gemini-3.8-flash-high', 'gemini-2.5-flash'];
+            let res = null;
+            let activeModel = candidateModels[0];
 
-          child.on('close', code => {
-            if (code === 0) {
-              resolve(output);
-            } else {
-              reject(new Error(`Antigravity CLI failed (code ${code}): ${errOutput || output}`));
+            for (const candModel of candidateModels) {
+              const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${candModel}:streamGenerateContent?alt=sse&key=${profile.apiKey}`;
+              const testRes = await fetch(apiUrl, {
+                method: 'POST',
+                headers: { 
+                  'Content-Type': 'application/json',
+                  'x-goog-api-key': profile.apiKey
+                },
+                body: JSON.stringify({
+                  contents: [{
+                    role: 'user',
+                    parts: [{ text: fullPrompt }]
+                  }]
+                })
+              });
+
+              if (testRes.ok) {
+                res = testRes;
+                activeModel = candModel;
+                break;
+              } else if (testRes.status === 404) {
+                continue;
+              } else {
+                const errData = await testRes.json().catch(() => ({}));
+                console.warn(`[VibeAgent] Gemini API model ${candModel} returned ${testRes.status}: ${errData?.error?.message || testRes.statusText}`);
+              }
             }
-          });
 
-          child.on('error', reject);
-        });
+            if (res && res.ok) {
+              const reader = res.body.getReader();
+              const decoder = new TextDecoder();
+              let buffer = '';
+
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop() || '';
+
+                for (const line of lines) {
+                  if (line.startsWith('data: ')) {
+                    try {
+                      const chunkJson = JSON.parse(line.slice(6));
+                      const parts = chunkJson.candidates?.[0]?.content?.parts || [];
+                      const chunkText = parts.map(p => p.text || '').join('');
+                      if (chunkText) {
+                        resultText += chunkText;
+                        if (onChunk) onChunk(chunkText);
+                      }
+                    } catch {}
+                  }
+                }
+              }
+
+              if (resultText && resultText.trim()) {
+                executionSuccess = true;
+              }
+            }
+          } catch (apiErr) {
+            console.warn(`[VibeAgent] Direct Gemini API failed: ${apiErr.message}. Falling back to Antigravity CLI...`);
+          }
+        }
+
+        // If direct API was not used or did not produce output, execute via Antigravity CLI
+        if (!executionSuccess) {
+          resultText = await new Promise((resolve, reject) => {
+            let output = '';
+            let errOutput = '';
+
+            const child = spawn(AGY_BIN, ['-p', fullPrompt, '--model', 'gemini-3.8-flash-high'], {
+              cwd: projectPath,
+              env,
+              stdio: ['ignore', 'pipe', 'pipe']
+            });
+
+            child.stdout.on('data', chunk => {
+              const str = chunk.toString();
+              output += str;
+              if (onChunk) onChunk(str);
+            });
+
+            child.stderr.on('data', chunk => {
+              errOutput += chunk.toString();
+            });
+
+            child.on('close', code => {
+              if (code === 0) {
+                resolve(output);
+              } else {
+                reject(new Error(`Antigravity CLI failed (code ${code}): ${errOutput || output}`));
+              }
+            });
+
+            child.on('error', reject);
+          });
+        }
 
         // Parse and execute tools
         const tools = parseToolsFromResponse(resultText);

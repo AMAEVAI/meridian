@@ -17,6 +17,17 @@ export class AccountRouter {
     this.coolDowns.set(profileId, Date.now() + durationMs);
   }
 
+  getCooldownRemaining(profileId) {
+    const until = this.coolDowns.get(profileId);
+    if (!until) return 0;
+    const diff = until - Date.now();
+    if (diff <= 0) {
+      this.coolDowns.delete(profileId);
+      return 0;
+    }
+    return diff;
+  }
+
   selectBestProfile(profiles, quotas = {}) {
     const available = profiles.filter(p => {
       if (!p.isActive) return false;
@@ -58,38 +69,61 @@ export class AccountRouter {
     return candidates;
   }
 
-  async executeWithFailover({ profiles, quotas = {}, runner }) {
+  async executeWithFailover({ profiles, quotas = {}, runner, onFailover }) {
     const ranked = this.getRankedProfiles(profiles, quotas);
     if (ranked.length === 0) {
-      throw new Error('No active Google AI profiles available in pool.');
+      throw new Error('Нет доступных активных Google AI аккаунтов в пуле.');
     }
 
     let lastError = null;
 
-    for (const profile of ranked) {
+    for (let i = 0; i < ranked.length; i++) {
+      const profile = ranked[i];
       try {
         const result = await runner(profile);
         return result;
       } catch (err) {
         lastError = err;
-        const msg = String(err.message || err);
-        const isRateLimit = msg.includes('429') || 
-                            msg.includes('RESOURCE_EXHAUSTED') || 
-                            msg.includes('quota') || 
-                            err.status === 429;
+        const msg = String(err.message || err).toLowerCase();
+        const isQuotaExhausted = msg.includes('429') || 
+                                 msg.includes('resource_exhausted') || 
+                                 msg.includes('quota') || 
+                                 msg.includes('rate limit') ||
+                                 msg.includes('limit') ||
+                                 msg.includes('capacity') ||
+                                 msg.includes('exhausted') ||
+                                 msg.includes('too many requests') ||
+                                 msg.includes('cooling') ||
+                                 err.status === 429;
 
-        if (isRateLimit) {
-          // Put this profile in a 5-minute cool down and fail over to the next
-          this.markCoolingDown(profile.id, 5 * 60 * 1000);
-          console.warn(`[AccountRouter] Profile ${profile.id} hit rate limit. Failing over to next account...`);
+        if (isQuotaExhausted) {
+          // Mark 5-hour cool down since 5h limit is reached
+          this.markCoolingDown(profile.id, 5 * 60 * 60 * 1000);
+          console.warn(`[AccountRouter] Profile ${profile.id} (${profile.email}) hit 5-hour limit. Failing over to next account...`);
+          
+          const nextProfile = ranked[i + 1];
+          if (onFailover && nextProfile) {
+            onFailover({
+              exhaustedProfile: profile,
+              nextProfile: nextProfile,
+              message: `5-часовой лимит исчерпан на ${profile.email || profile.name}. Автоматически переключаюсь на следующий аккаунт: ${nextProfile.email || nextProfile.name}...`
+            });
+          }
           continue;
         }
 
-        // If it's a fatal execution error not related to rate limits, still try another account or rethrow
         console.warn(`[AccountRouter] Profile ${profile.id} encountered error: ${msg}. Attempting next account...`);
+        const nextProfile = ranked[i + 1];
+        if (onFailover && nextProfile) {
+          onFailover({
+            exhaustedProfile: profile,
+            nextProfile: nextProfile,
+            message: `Ошибка на ${profile.email || profile.name}. Переключаюсь на резервный аккаунт ${nextProfile.email || nextProfile.name}...`
+          });
+        }
       }
     }
 
-    throw lastError || new Error('All accounts in the pool failed to execute the request.');
+    throw lastError || new Error('Все 5 аккаунтов Google в пуле исчерпали квоты.');
   }
 }

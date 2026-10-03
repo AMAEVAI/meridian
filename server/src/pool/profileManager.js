@@ -1,6 +1,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { PROFILES_DIR, NUM_SLOTS } from '../config.js';
+import os from 'node:os';
+import { PROFILES_DIR, NUM_SLOTS, loadEnvFile } from '../config.js';
+
+const DEFAULT_EMAILS = [
+  'djislam095@gmail.com',
+  'amaievislam91@gmail.com',
+  'amaev.pro@gmail.com',
+  'chechenstrike@gmail.com',
+  'contact.suppressed@gmail.com'
+];
 
 export class ProfileManager {
   constructor(options = {}) {
@@ -17,6 +26,8 @@ export class ProfileManager {
     for (let i = 1; i <= this.numSlots; i++) {
       this.ensureProfileSlot(i);
     }
+
+    this.syncFromEnv();
   }
 
   ensureProfileSlot(index) {
@@ -46,18 +57,19 @@ export class ProfileManager {
 
     // Default metadata.json
     const metaPath = path.join(profileDir, 'metadata.json');
+    const defaultEmail = DEFAULT_EMAILS[index - 1] || '';
+
     if (!fs.existsSync(metaPath)) {
-      const isPrimary = index === 1;
       const defaultMeta = {
         id,
         index,
-        name: isPrimary ? 'Основной аккаунт' : `Google Аккаунт #${index}`,
-        email: isPrimary ? 'yataev91@gmail.com' : '',
-        authType: isPrimary ? 'system' : 'api_key', // 'system' | 'api_key' | 'oauth'
+        name: `Google Аккаунт #${index}`,
+        email: defaultEmail,
+        authType: 'api_key',
         apiKey: '',
         isActive: true,
-        status: isPrimary ? 'ready' : 'unconfigured',
-        isPrimary,
+        status: 'unconfigured',
+        isPrimary: index === 1,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       };
@@ -65,7 +77,58 @@ export class ProfileManager {
     }
   }
 
+  syncFromEnv() {
+    const { parsed } = loadEnvFile();
+
+    for (let i = 1; i <= this.numSlots; i++) {
+      const id = `profile_${i}`;
+      const profileDir = path.join(this.baseDir, id);
+      const metaPath = path.join(profileDir, 'metadata.json');
+
+      const envKey = parsed[`GOOGLE_API_KEY_${i}`] || 
+                     parsed[`GEMINI_API_KEY_${i}`] ||
+                     (i === 1 ? (parsed['GOOGLE_API_KEY'] || parsed['GEMINI_API_KEY']) : '');
+
+      const envEmail = parsed[`GOOGLE_ACCOUNT_EMAIL_${i}`] || 
+                       parsed[`GEMINI_ACCOUNT_EMAIL_${i}`] || 
+                       DEFAULT_EMAILS[i - 1];
+
+      if (fs.existsSync(metaPath)) {
+        try {
+          const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+          let modified = false;
+
+          if (envEmail && meta.email !== envEmail) {
+            meta.email = envEmail;
+            modified = true;
+          }
+
+          if (envKey && envKey.trim()) {
+            const trimmedKey = envKey.trim();
+            if (meta.apiKey !== trimmedKey) {
+              meta.apiKey = trimmedKey;
+              meta.authType = 'api_key';
+              meta.status = 'ready';
+              meta.isActive = true;
+              modified = true;
+            }
+          }
+
+          if (modified) {
+            meta.updatedAt = new Date().toISOString();
+            fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf8');
+          }
+        } catch (e) {
+          console.warn(`[ProfileManager] Failed syncing profile_${i} from .env:`, e.message);
+        }
+      }
+    }
+  }
+
   listProfiles() {
+    // Dynamic refresh from .env on list
+    this.syncFromEnv();
+
     const list = [];
     for (let i = 1; i <= this.numSlots; i++) {
       const id = `profile_${i}`;
@@ -74,11 +137,11 @@ export class ProfileManager {
       if (fs.existsSync(metaPath)) {
         try {
           const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
-          // Mask API key in public list for security
-          const maskedKey = meta.apiKey ? `${meta.apiKey.slice(0, 6)}...${meta.apiKey.slice(-4)}` : '';
+          const { apiKey, ...safeMeta } = meta;
+          const maskedKey = apiKey ? `${apiKey.slice(0, 4)}...${apiKey.slice(-4)}` : '';
           list.push({ 
-            ...meta, 
-            hasApiKey: Boolean(meta.apiKey),
+            ...safeMeta, 
+            hasApiKey: Boolean(apiKey),
             apiKeyMasked: maskedKey,
             path: profileDir 
           });
@@ -118,18 +181,8 @@ export class ProfileManager {
       updatedAt: new Date().toISOString()
     };
 
-    // If API key is provided, configure settings.json for gemini model provider
-    const cliSettingsPath = path.join(profileDir, 'antigravity-cli', 'settings.json');
-    if (updated.authType === 'api_key' && updated.apiKey) {
-      updated.status = 'ready';
-      if (fs.existsSync(cliSettingsPath)) {
-        try {
-          const s = JSON.parse(fs.readFileSync(cliSettingsPath, 'utf8'));
-          s.modelProvider = 'gemini';
-          fs.writeFileSync(cliSettingsPath, JSON.stringify(s, null, 2), 'utf8');
-        } catch {}
-      }
-    } else if (updated.authType === 'system' || updated.isPrimary) {
+    if (updated.apiKey) {
+      updated.authType = 'api_key';
       updated.status = 'ready';
     }
 
@@ -140,11 +193,10 @@ export class ProfileManager {
   resetProfile(id) {
     const profile = this.getProfile(id);
     if (!profile) return false;
-    if (profile.isPrimary) return false; // don't reset primary account
 
     return this.updateProfile(id, {
       name: `Google Аккаунт #${profile.index}`,
-      email: '',
+      email: DEFAULT_EMAILS[profile.index - 1] || '',
       authType: 'api_key',
       apiKey: '',
       status: 'unconfigured',
@@ -156,19 +208,15 @@ export class ProfileManager {
     const profile = this.getProfile(id);
     if (!profile) throw new Error(`Profile ${id} not found`);
 
-    if (profile.isPrimary || id === 'profile_1') {
-      return { ...process.env };
-    }
-
+    // IMPORTANT: Always preserve system HOME so agy has full access to credentials/keyring
     const env = {
       ...process.env,
-      HOME: profile.path,
-      AGY_HOME: profile.path,
-      GEMINI_CLI_HOME: profile.path
+      HOME: process.env.HOME || os.homedir()
     };
 
-    if (profile.authType === 'api_key' && profile.apiKey) {
+    if (profile.apiKey) {
       env.GEMINI_API_KEY = profile.apiKey;
+      env.GOOGLE_API_KEY = profile.apiKey;
     }
 
     return env;

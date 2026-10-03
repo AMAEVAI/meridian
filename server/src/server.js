@@ -38,7 +38,8 @@ export function createServer() {
       const data = profiles.map(p => ({
         ...p,
         quota: quotas[p.id] || { gemini5h: 0, geminiWeekly: 0 },
-        isCoolingDown: accountRouter.isCoolingDown(p.id)
+        isCoolingDown: accountRouter.isCoolingDown(p.id),
+        cooldownRemainingMs: accountRouter.getCooldownRemaining(p.id)
       }));
       res.json({ profiles: data });
     } catch (err) {
@@ -65,11 +66,12 @@ export function createServer() {
       const updated = profileManager.updateProfile(id, {
         ...(name !== undefined && { name }),
         ...(email !== undefined && { email }),
-        ...(apiKey !== undefined && { apiKey }),
+        ...(apiKey && typeof apiKey === 'string' && apiKey.trim() !== '' && { apiKey: apiKey.trim() }),
         ...(authType !== undefined && { authType }),
         ...(isActive !== undefined && { isActive })
       });
-      res.json({ success: true, profile: updated });
+      const { apiKey: _rawKey, ...safeUpdated } = updated;
+      res.json({ success: true, profile: { ...safeUpdated, hasApiKey: Boolean(updated.apiKey) } });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
@@ -81,21 +83,35 @@ export function createServer() {
       const profile = profileManager.getProfile(id);
       if (!profile) return res.status(404).json({ error: 'Profile not found' });
 
-      // Run quick model check with this profile
-      const env = profileManager.getEnv(id);
-      const { execFile } = await import('node:child_process');
-      const { promisify } = await import('node:util');
-      const execFileAsync = promisify(execFile);
+      if (profile.apiKey) {
+        // Direct test against Google Gemini API without spawning browser OAuth
+        const testRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${profile.apiKey}`);
+        const testData = await testRes.json();
+        if (!testRes.ok) {
+          throw new Error(testData?.error?.message || `Google API returned ${testRes.status}`);
+        }
+        profileManager.updateProfile(id, { status: 'ready', authType: 'api_key' });
+        return res.json({ success: true, message: 'Google Gemini API ключ успешно подтвержден!' });
+      }
 
-      const { stdout } = await execFileAsync(AGY_BIN, ['models'], {
-        env,
-        timeout: 10000
-      });
+      if (profile.isPrimary || id === 'profile_1') {
+        const env = profileManager.getEnv(id);
+        const { execFile } = await import('node:child_process');
+        const { promisify } = await import('node:util');
+        const execFileAsync = promisify(execFile);
 
-      profileManager.updateProfile(id, { status: 'ready' });
-      res.json({ success: true, message: 'Account connected and verified successfully!' });
+        await execFileAsync(AGY_BIN, ['models'], {
+          env,
+          timeout: 10000
+        });
+
+        profileManager.updateProfile(id, { status: 'ready' });
+        return res.json({ success: true, message: 'Основной аккаунт подтвержден и готов к работе!' });
+      }
+
+      return res.status(400).json({ error: 'Укажите Gemini API ключ для этого профиля.' });
     } catch (err) {
-      res.status(400).json({ error: `Connection test failed: ${err.message}` });
+      res.status(400).json({ error: `Ошибка проверки подключения: ${err.message}` });
     }
   });
 
@@ -214,15 +230,16 @@ export function createServer() {
       try {
         const msg = JSON.parse(raw.toString());
         if (msg.type === 'prompt') {
-          const { projectId, prompt, model } = msg;
+          const { projectId, prompt, history, model } = msg;
 
           await vibeAgent.run({
             projectId,
             prompt,
+            history: history || [],
             model: model || 'gemini-3.8-flash-high',
             onStatus: (status) => {
               if (ws.readyState === ws.OPEN) {
-                ws.send(JSON.stringify({ type: 'status', ...status }));
+                ws.send(JSON.stringify(status));
               }
             },
             onChunk: (chunk) => {

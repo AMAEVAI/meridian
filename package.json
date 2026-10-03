@@ -5,6 +5,7 @@
   "description": "Multi-Account Antigravity Vibe-Coding Platform SaaS",
   "type": "module",
   "scripts": {
+    "dev": "node scripts/start.js",
     "server": "node server/src/server.js",
     "client": "npm --prefix client run dev",
     "build": "npm --prefix client run build",
