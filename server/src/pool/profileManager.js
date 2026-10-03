@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { PROFILES_DIR, NUM_SLOTS } from '../config.js';
 
 export class ProfileManager {
@@ -47,13 +48,15 @@ export class ProfileManager {
     // Ensure metadata.json
     const metaPath = path.join(profileDir, 'metadata.json');
     if (!fs.existsSync(metaPath)) {
+      const isPrimary = index === 1;
       const defaultMeta = {
         id,
         index,
-        name: `Google Account #${index}`,
-        email: null,
+        name: isPrimary ? 'Primary Account (yataev91@gmail.com)' : `Google Profile #${index}`,
+        email: isPrimary ? 'yataev91@gmail.com' : null,
         isActive: true,
-        status: index === 1 ? 'ready' : 'unconfigured',
+        status: isPrimary ? 'ready' : 'unconfigured',
+        isPrimary,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       };
@@ -72,7 +75,7 @@ export class ProfileManager {
           const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
           list.push({ ...meta, path: profileDir });
         } catch {
-          list.push({ id, index: i, name: `Account #${i}`, isActive: true, status: 'error', path: profileDir });
+          list.push({ id, index: i, name: `Account #${i}`, isActive: true, status: 'unconfigured', path: profileDir });
         }
       }
     }
@@ -103,6 +106,15 @@ export class ProfileManager {
   getEnv(id) {
     const profile = this.getProfile(id);
     if (!profile) throw new Error(`Profile ${id} not found`);
+
+    // Profile 1 uses the default primary user environment (which is already signed in!)
+    if (profile.isPrimary || id === 'profile_1') {
+      return {
+        ...process.env
+      };
+    }
+
+    // Secondary profiles use isolated directory
     return {
       ...process.env,
       HOME: profile.path,

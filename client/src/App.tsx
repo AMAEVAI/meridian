@@ -28,14 +28,10 @@ export default function App() {
 
   const wsRef = useRef(null);
 
-  // 1. Initial Load & Polling
+  // 1. Initial Load
   useEffect(() => {
     fetchProjects();
     fetchProfiles();
-
-    // Poll profile quotas every 15 seconds
-    const interval = setInterval(fetchProfiles, 15000);
-    return () => clearInterval(interval);
   }, []);
 
   // 2. Fetch Helpers

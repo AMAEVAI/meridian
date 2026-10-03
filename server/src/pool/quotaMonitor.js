@@ -1,5 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import fs from 'node:fs';
+import path from 'node:path';
 import { AGY_BIN } from '../config.js';
 
 const execFileAsync = promisify(execFile);
@@ -8,7 +10,7 @@ export class QuotaMonitor {
   constructor(options = {}) {
     this.profileManager = options.profileManager;
     this.cache = new Map(); // profileId -> { quota, timestamp }
-    this.cacheTtlMs = options.cacheTtlMs || 30000;
+    this.cacheTtlMs = options.cacheTtlMs || 60000; // 60 seconds
   }
 
   async fetchQuotaForProfile(profile) {
@@ -18,23 +20,26 @@ export class QuotaMonitor {
       return cached.quota;
     }
 
-    if (profile.status === 'unconfigured') {
-      return {
+    // Safety guard: only fetch quota if profile is ready/primary.
+    // NEVER execute agy on unconfigured or unverified profiles to avoid triggering browser login!
+    if (profile.status !== 'ready' && !profile.isPrimary && profile.id !== 'profile_1') {
+      const fallback = {
         gemini5h: 0,
         geminiWeekly: 0,
         other5h: 0,
         otherWeekly: 0,
         status: 'unconfigured'
       };
+      this.cache.set(profile.id, { quota: fallback, timestamp: now });
+      return fallback;
     }
 
     try {
       const env = this.profileManager ? this.profileManager.getEnv(profile.id) : process.env;
       
-      // Probe agy for usage in json format
       const { stdout } = await execFileAsync(AGY_BIN, ['-p', '/usage', '--output-format', 'json'], {
         env,
-        timeout: 10000
+        timeout: 8000
       });
 
       const parsed = JSON.parse(stdout);
@@ -42,7 +47,6 @@ export class QuotaMonitor {
       this.cache.set(profile.id, { quota, timestamp: now });
       return quota;
     } catch (err) {
-      // Return fallback cached or zero quota with error status
       const fallback = cached ? cached.quota : {
         gemini5h: 0,
         geminiWeekly: 0,
@@ -51,6 +55,7 @@ export class QuotaMonitor {
         status: 'error',
         error: err.message
       };
+      this.cache.set(profile.id, { quota: fallback, timestamp: now });
       return fallback;
     }
   }
@@ -61,15 +66,20 @@ export class QuotaMonitor {
     let other5h = 0;
     let otherWeekly = 0;
 
-    // Standard Antigravity response structure
-    const windows = json?.command?.data?.quota?.windows || json?.windows || [];
-    for (const win of windows) {
-      const type = win.type || '';
-      const util = typeof win.utilization === 'number' ? win.utilization : 0;
-      if (type.includes('gemini-5h') || type === '5h') gemini5h = util;
-      else if (type.includes('gemini-weekly') || type === 'weekly') geminiWeekly = util;
-      else if (type.includes('3p-5h')) other5h = util;
-      else if (type.includes('3p-weekly')) otherWeekly = util;
+    // Check command.data.groups structure
+    const groups = json?.command?.data?.groups || [];
+    for (const group of groups) {
+      const buckets = group.buckets || [];
+      for (const bucket of buckets) {
+        const id = bucket.id || '';
+        const remaining = typeof bucket.remaining_fraction === 'number' ? bucket.remaining_fraction : 1;
+        const utilized = Math.max(0, 1 - remaining);
+
+        if (id.includes('gemini-5h')) gemini5h = utilized;
+        else if (id.includes('gemini-weekly')) geminiWeekly = utilized;
+        else if (id.includes('3p-5h')) other5h = utilized;
+        else if (id.includes('3p-weekly')) otherWeekly = utilized;
+      }
     }
 
     return {

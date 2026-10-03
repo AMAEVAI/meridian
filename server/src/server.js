@@ -61,17 +61,10 @@ export function createServer() {
   app.post('/api/profiles/:id/auth', (req, res) => {
     try {
       const { id } = req.params;
-      const env = profileManager.getEnv(id);
-      // Spawn agy models or agy auth to trigger browser OAuth flow in isolated profile
-      const child = spawn(AGY_BIN, ['models'], {
-        env,
-        detached: true,
-        stdio: 'ignore'
-      });
-      child.unref();
-
-      profileManager.updateProfile(id, { status: 'ready' });
-      res.json({ success: true, message: `Authentication triggered for ${id}. Please complete Google sign-in in browser.` });
+      if (id === 'profile_1') {
+        return res.json({ success: true, message: 'Profile 1 is your primary active Google account and is already authenticated!' });
+      }
+      res.json({ success: true, message: `To connect profile ${id}, please run in terminal: agy --config-dir ~/.meridian-studio/profiles/${id}` });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
