@@ -86,8 +86,10 @@ export function parseToolsFromResponse(text, availableFiles = ['index.html', 'st
 export class VibeAgent {
   constructor(options = {}) {
     this.profileManager = options.profileManager;
+    this.providerManager = options.providerManager;
     this.quotaMonitor = options.quotaMonitor;
     this.accountRouter = options.accountRouter;
+    this.routerEngine = options.routerEngine;
     this.workspaceManager = options.workspaceManager;
     this.usageTracker = options.usageTracker;
   }
@@ -155,6 +157,259 @@ npm install package-name
   }
 
   async run({ projectId, prompt, history = [], model = 'gemini-3.8-flash', onChunk, onTool, onStatus }) {
+    const systemPrompt = this.buildSystemPrompt(projectId);
+    const projectPath = this.workspaceManager.getProjectPath(projectId);
+
+    // If RouterEngine is available, use FreeLLMAPI-style intelligent routing across Google + External providers
+    if (this.routerEngine) {
+      return await this.routerEngine.executeWithFailover({
+        prompt,
+        preferredModel: model,
+        onFailover: ({ exhaustedCandidate, nextCandidate, message }) => {
+          if (onStatus) {
+            onStatus({
+              type: 'failover',
+              message,
+              exhaustedProfileId: exhaustedCandidate.id,
+              nextProfileId: nextCandidate.id,
+              exhaustedEmail: exhaustedCandidate.email || exhaustedCandidate.name,
+              nextEmail: nextCandidate.email || nextCandidate.name
+            });
+          }
+        },
+        runner: async (candidate) => {
+          if (onStatus) {
+            onStatus({
+              type: 'status',
+              message: `Запрос через ${candidate.name} (${candidate.modelName || candidate.modelId})...`,
+              profileId: candidate.id,
+              profileName: candidate.name,
+              email: candidate.email
+            });
+          }
+
+          let resultText = '';
+
+          // A. EXTERNAL OPENAI-COMPATIBLE PROVIDER (Groq, OpenRouter, Cerebras, Custom/Ollama)
+          if (candidate.type === 'external_provider') {
+            const openAiMessages = [
+              { role: 'system', content: systemPrompt },
+              ...(Array.isArray(history) 
+                ? history.filter(m => (m.role === 'user' || m.role === 'assistant') && m.content).slice(-8).map(m => ({ role: m.role, content: m.content })) 
+                : []),
+              { role: 'user', content: prompt }
+            ];
+
+            const streamRes = await fetch(`${candidate.baseUrl.replace(/\/$/, '')}/chat/completions`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                ...(candidate.apiKey ? { 'Authorization': `Bearer ${candidate.apiKey}` } : {})
+              },
+              body: JSON.stringify({
+                model: candidate.modelId,
+                messages: openAiMessages,
+                temperature: 0.4,
+                stream: true
+              })
+            });
+
+            if (!streamRes.ok) {
+              const errData = await streamRes.json().catch(() => ({}));
+              throw new Error(`${candidate.name} вернул ошибку ${streamRes.status}: ${errData?.error?.message || streamRes.statusText}`);
+            }
+
+            const reader = streamRes.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split('\n');
+              buffer = lines.pop() || '';
+
+              for (const rawLine of lines) {
+                const line = rawLine.trim();
+                if (line.startsWith('data:')) {
+                  const dataStr = line.replace(/^data:\s*/, '').trim();
+                  if (!dataStr || dataStr === '[DONE]') continue;
+                  try {
+                    const parsed = JSON.parse(dataStr);
+                    const chunkText = parsed.choices?.[0]?.delta?.content || '';
+                    if (chunkText) {
+                      resultText += chunkText;
+                      if (onChunk) onChunk(chunkText);
+                    }
+                  } catch {}
+                }
+              }
+            }
+
+            if (!resultText.trim()) {
+              throw new Error(`Пустой ответ от ${candidate.name}`);
+            }
+          } 
+          // B. GOOGLE GEMINI ACCOUNT
+          else {
+            const profile = this.profileManager.getProfile(candidate.id) || candidate;
+            const isApiKey = profile.apiKey && 
+                             !profile.apiKey.trim().startsWith('4/') && 
+                             profile.apiKey.trim().length > 15;
+
+            if (isApiKey) {
+              const formattedContents = [];
+              if (Array.isArray(history) && history.length > 0) {
+                const recent = history.filter(m => (m.role === 'user' || m.role === 'assistant') && m.content).slice(-8);
+                for (const m of recent) {
+                  formattedContents.push({
+                    role: m.role === 'user' ? 'user' : 'model',
+                    parts: [{ text: m.content }]
+                  });
+                }
+              }
+              formattedContents.push({
+                role: 'user',
+                parts: [{ text: prompt }]
+              });
+
+              const candidateModels = [candidate.modelId || 'gemini-3.8-flash', 'gemini-3-flash-preview', 'gemini-2.5-flash'];
+              let apiSuccess = false;
+              let lastApiError = null;
+
+              for (const candModel of candidateModels) {
+                try {
+                  const streamUrl = `https://generativelanguage.googleapis.com/v1beta/models/${candModel}:streamGenerateContent?alt=sse&key=${profile.apiKey}`;
+                  const testRes = await fetch(streamUrl, {
+                    method: 'POST',
+                    headers: { 
+                      'Content-Type': 'application/json',
+                      'x-goog-api-key': profile.apiKey
+                    },
+                    body: JSON.stringify({
+                      systemInstruction: { parts: [{ text: systemPrompt }] },
+                      contents: formattedContents,
+                      generationConfig: { temperature: 0.4, maxOutputTokens: 65536 }
+                    })
+                  });
+
+                  if (testRes.ok) {
+                    const reader = testRes.body.getReader();
+                    const decoder = new TextDecoder();
+                    let buffer = '';
+
+                    while (true) {
+                      const { done, value } = await reader.read();
+                      if (done) break;
+                      buffer += decoder.decode(value, { stream: true });
+                      const lines = buffer.split('\n');
+                      buffer = lines.pop() || '';
+
+                      for (const rawLine of lines) {
+                        const line = rawLine.trim();
+                        if (line.startsWith('data:')) {
+                          try {
+                            const jsonStr = line.replace(/^data:\s*/, '');
+                            if (!jsonStr) continue;
+                            const chunkJson = JSON.parse(jsonStr);
+                            const parts = chunkJson.candidates?.[0]?.content?.parts || [];
+                            for (const p of parts) {
+                              const chunkText = p.text || '';
+                              if (chunkText) {
+                                resultText += chunkText;
+                                if (onChunk) onChunk(chunkText);
+                              }
+                            }
+                          } catch {}
+                        }
+                      }
+                    }
+
+                    if (resultText && resultText.trim()) {
+                      apiSuccess = true;
+                      break;
+                    }
+                  } else {
+                    const errData = await testRes.json().catch(() => ({}));
+                    lastApiError = new Error(`Google API ${candModel} returned ${testRes.status}: ${errData?.error?.message || testRes.statusText}`);
+                  }
+                } catch (err) {
+                  lastApiError = err;
+                }
+              }
+
+              if (!apiSuccess || !resultText.trim()) {
+                throw lastApiError || new Error(`Google Gemini API error on ${profile.name}. Triggering failover...`);
+              }
+            } else {
+              // Antigravity CLI Execution
+              const env = this.profileManager.getEnv(profile.id);
+              resultText = await new Promise((resolve, reject) => {
+                let output = '';
+                let errOutput = '';
+                const child = spawn(AGY_BIN, ['-p', `${systemPrompt}\n\nUSER REQUEST:\n${prompt}`, '--model', 'gemini-3.8-flash-high'], {
+                  cwd: projectPath,
+                  env,
+                  stdio: ['ignore', 'pipe', 'pipe']
+                });
+                child.stdout.on('data', chunk => {
+                  const str = chunk.toString();
+                  output += str;
+                  if (onChunk) onChunk(str);
+                });
+                child.stderr.on('data', chunk => { errOutput += chunk.toString(); });
+                child.on('close', code => {
+                  if (code === 0) resolve(output);
+                  else reject(new Error(`Antigravity CLI failed (code ${code}): ${errOutput || output}`));
+                });
+                child.on('error', reject);
+              });
+            }
+          }
+
+          // Parse and execute tools
+          const tools = parseToolsFromResponse(resultText);
+          const appliedChanges = [];
+
+          for (const tool of tools) {
+            if (tool.type === 'WRITE_FILE') {
+              let originalContent = '';
+              try { originalContent = this.workspaceManager.readFile(projectId, tool.path); } catch { originalContent = ''; }
+              this.workspaceManager.writeFile(projectId, tool.path, tool.content);
+              appliedChanges.push({ type: 'file_written', path: tool.path, original: originalContent, updated: tool.content });
+              if (onTool) onTool({ tool: 'WRITE_FILE', path: tool.path, original: originalContent, updated: tool.content });
+            } else if (tool.type === 'COMMAND') {
+              try {
+                const { exec } = await import('node:child_process');
+                const { promisify } = await import('node:util');
+                const execAsync = promisify(exec);
+                const { stdout, stderr } = await execAsync(tool.command, { cwd: projectPath, timeout: 30000 });
+                appliedChanges.push({ type: 'command_executed', command: tool.command, output: stdout || stderr });
+                if (onTool) onTool({ tool: 'COMMAND', command: tool.command, output: stdout || stderr });
+              } catch (cmdErr) {
+                appliedChanges.push({ type: 'command_failed', command: tool.command, error: cmdErr.message });
+                if (onTool) onTool({ tool: 'COMMAND', command: tool.command, error: cmdErr.message });
+              }
+            }
+          }
+
+          // Record usage
+          if (this.usageTracker) {
+            const estimatedTokens = Math.round(resultText.length / 4);
+            this.usageTracker.recordRequest(candidate.id, { tokensUsed: estimatedTokens, model: candidate.modelId });
+          }
+
+          return {
+            text: resultText,
+            toolsApplied: appliedChanges,
+            profileUsed: candidate
+          };
+        }
+      });
+    }
+
+    // Fallback legacy router if RouterEngine not set
     const profiles = this.profileManager.listProfiles();
     const quotas = await this.quotaMonitor.getAllQuotas(profiles);
 
@@ -184,57 +439,35 @@ npm install package-name
           });
         }
 
-        const systemPrompt = this.buildSystemPrompt(projectId);
-        const env = this.profileManager.getEnv(profile.id);
-        const projectPath = this.workspaceManager.getProjectPath(projectId);
-
         let resultText = '';
-
         const isApiKey = profile.apiKey && 
                          !profile.apiKey.trim().startsWith('4/') && 
                          profile.apiKey.trim().length > 15;
 
         if (isApiKey) {
-          // Build conversation history in Gemini contents format
           const formattedContents = [];
           if (Array.isArray(history) && history.length > 0) {
             const recent = history.filter(m => (m.role === 'user' || m.role === 'assistant') && m.content).slice(-8);
             for (const m of recent) {
-              formattedContents.push({
-                role: m.role === 'user' ? 'user' : 'model',
-                parts: [{ text: m.content }]
-              });
+              formattedContents.push({ role: m.role === 'user' ? 'user' : 'model', parts: [{ text: m.content }] });
             }
           }
-          formattedContents.push({
-            role: 'user',
-            parts: [{ text: prompt }]
-          });
+          formattedContents.push({ role: 'user', parts: [{ text: prompt }] });
 
-          // Models list: gemini-3.8-flash primary, then gemini-3-flash-preview, gemini-3.5-flash
           const candidateModels = ['gemini-3.8-flash', 'gemini-3-flash-preview', 'gemini-3.5-flash'];
           let apiSuccess = false;
           let lastApiError = null;
 
           for (const candModel of candidateModels) {
             try {
-              // Try SSE Streaming first
               const streamUrl = `https://generativelanguage.googleapis.com/v1beta/models/${candModel}:streamGenerateContent?alt=sse&key=${profile.apiKey}`;
               const testRes = await fetch(streamUrl, {
                 method: 'POST',
-                headers: { 
-                  'Content-Type': 'application/json',
-                  'x-goog-api-key': profile.apiKey
-                },
+                headers: { 'Content-Type': 'application/json', 'x-goog-api-key': profile.apiKey },
                 body: JSON.stringify({
-                  systemInstruction: {
-                    parts: [{ text: systemPrompt }]
-                  },
+                  systemInstruction: { parts: [{ text: systemPrompt }] },
                   contents: formattedContents,
-                  generationConfig: {
-                    temperature: 0.4,
-                    maxOutputTokens: 65536
-                  }
+                  generationConfig: { temperature: 0.4, maxOutputTokens: 65536 }
                 })
               });
 
@@ -275,151 +508,65 @@ npm install package-name
                   break;
                 }
               }
-
-              // Fallback to non-streaming if stream was empty or failed
-              const genUrl = `https://generativelanguage.googleapis.com/v1beta/models/${candModel}:generateContent?key=${profile.apiKey}`;
-              const genRes = await fetch(genUrl, {
-                method: 'POST',
-                headers: { 
-                  'Content-Type': 'application/json',
-                  'x-goog-api-key': profile.apiKey
-                },
-                body: JSON.stringify({
-                  systemInstruction: {
-                    parts: [{ text: systemPrompt }]
-                  },
-                  contents: formattedContents,
-                  generationConfig: {
-                    temperature: 0.4,
-                    maxOutputTokens: 65536
-                  }
-                })
-              });
-
-              if (genRes.ok) {
-                const genData = await genRes.json();
-                const parts = genData.candidates?.[0]?.content?.parts || [];
-                const fullGenText = parts.map(p => p.text || '').join('');
-                if (fullGenText && fullGenText.trim()) {
-                  resultText = fullGenText;
-                  if (onChunk) onChunk(fullGenText);
-                  apiSuccess = true;
-                  break;
-                }
-              } else {
-                const errData = await genRes.json().catch(() => ({}));
-                lastApiError = new Error(`Google API ${candModel} returned ${genRes.status}: ${errData?.error?.message || genRes.statusText}`);
-              }
             } catch (err) {
               lastApiError = err;
             }
           }
 
           if (!apiSuccess || !resultText.trim()) {
-            // Throw error to trigger AccountRouter failover to next Google account!
             throw lastApiError || new Error(`Google Gemini API error on ${profile.name}. Triggering failover...`);
           }
         } else {
-          // Antigravity CLI Execution
+          const env = this.profileManager.getEnv(profile.id);
           resultText = await new Promise((resolve, reject) => {
             let output = '';
             let errOutput = '';
-
             const child = spawn(AGY_BIN, ['-p', `${systemPrompt}\n\nUSER REQUEST:\n${prompt}`, '--model', 'gemini-3.8-flash-high'], {
               cwd: projectPath,
               env,
               stdio: ['ignore', 'pipe', 'pipe']
             });
-
             child.stdout.on('data', chunk => {
               const str = chunk.toString();
               output += str;
               if (onChunk) onChunk(str);
             });
-
-            child.stderr.on('data', chunk => {
-              errOutput += chunk.toString();
-            });
-
+            child.stderr.on('data', chunk => { errOutput += chunk.toString(); });
             child.on('close', code => {
-              if (code === 0) {
-                resolve(output);
-              } else {
-                reject(new Error(`Antigravity CLI failed (code ${code}): ${errOutput || output}`));
-              }
+              if (code === 0) resolve(output);
+              else reject(new Error(`Antigravity CLI failed (code ${code}): ${errOutput || output}`));
             });
-
             child.on('error', reject);
           });
         }
 
-        // Parse and execute tools
         const tools = parseToolsFromResponse(resultText);
         const appliedChanges = [];
 
         for (const tool of tools) {
           if (tool.type === 'WRITE_FILE') {
             let originalContent = '';
-            try {
-              originalContent = this.workspaceManager.readFile(projectId, tool.path);
-            } catch {
-              originalContent = '';
-            }
-
+            try { originalContent = this.workspaceManager.readFile(projectId, tool.path); } catch { originalContent = ''; }
             this.workspaceManager.writeFile(projectId, tool.path, tool.content);
-            appliedChanges.push({
-              type: 'file_written',
-              path: tool.path,
-              original: originalContent,
-              updated: tool.content
-            });
-
-            if (onTool) {
-              onTool({
-                tool: 'WRITE_FILE',
-                path: tool.path,
-                original: originalContent,
-                updated: tool.content
-              });
-            }
+            appliedChanges.push({ type: 'file_written', path: tool.path, original: originalContent, updated: tool.content });
+            if (onTool) onTool({ tool: 'WRITE_FILE', path: tool.path, original: originalContent, updated: tool.content });
           } else if (tool.type === 'COMMAND') {
             try {
               const { exec } = await import('node:child_process');
               const { promisify } = await import('node:util');
               const execAsync = promisify(exec);
               const { stdout, stderr } = await execAsync(tool.command, { cwd: projectPath, timeout: 30000 });
-              appliedChanges.push({
-                type: 'command_executed',
-                command: tool.command,
-                output: stdout || stderr
-              });
-              if (onTool) {
-                onTool({
-                  tool: 'COMMAND',
-                  command: tool.command,
-                  output: stdout || stderr
-                });
-              }
+              appliedChanges.push({ type: 'command_executed', command: tool.command, output: stdout || stderr });
+              if (onTool) onTool({ tool: 'COMMAND', command: tool.command, output: stdout || stderr });
             } catch (cmdErr) {
-              appliedChanges.push({
-                type: 'command_failed',
-                command: tool.command,
-                error: cmdErr.message
-              });
-              if (onTool) {
-                onTool({
-                  tool: 'COMMAND',
-                  command: tool.command,
-                  error: cmdErr.message
-                });
-              }
+              appliedChanges.push({ type: 'command_failed', command: tool.command, error: cmdErr.message });
+              if (onTool) onTool({ tool: 'COMMAND', command: tool.command, error: cmdErr.message });
             }
           }
         }
 
-        // Record usage for this profile
         if (this.usageTracker) {
-          const estimatedTokens = Math.round(resultText.length / 4); // rough estimate: 1 token ≈ 4 chars
+          const estimatedTokens = Math.round(resultText.length / 4);
           this.usageTracker.recordRequest(profile.id, { tokensUsed: estimatedTokens, model: model || 'gemini-3.8-flash' });
         }
 

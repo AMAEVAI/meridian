@@ -13,6 +13,10 @@ import { DevRunner } from './workspace/devRunner.js';
 import { GitService } from './git/gitService.js';
 import { VibeAgent } from './agent/vibeAgent.js';
 import { UsageTracker } from './pool/usageTracker.js';
+import { ProviderManager } from './pool/providerManager.js';
+import { RouterEngine, ROUTING_STRATEGIES } from './pool/routerEngine.js';
+import { CooldownLadder } from './pool/cooldownLadder.js';
+import { OpenAiGateway } from './pool/openAiGateway.js';
 
 export function createServer() {
   const app = express();
@@ -22,15 +26,40 @@ export function createServer() {
   app.use(cors());
   app.use(express.json());
 
-  // Initialize subsystems
+  // Initialize FreeLLMAPI-style multi-provider subsystems
   const profileManager = new ProfileManager();
+  const providerManager = new ProviderManager();
   const quotaMonitor = new QuotaMonitor({ profileManager });
+  const cooldownLadder = new CooldownLadder();
   const accountRouter = new AccountRouter();
   const workspaceManager = new WorkspaceManager();
   const devRunner = new DevRunner();
   const gitService = new GitService();
   const usageTracker = new UsageTracker();
-  const vibeAgent = new VibeAgent({ profileManager, quotaMonitor, accountRouter, workspaceManager, usageTracker });
+
+  const routerEngine = new RouterEngine({
+    profileManager,
+    providerManager,
+    usageTracker,
+    cooldownLadder,
+    strategy: 'balanced'
+  });
+
+  const openAiGateway = new OpenAiGateway({
+    routerEngine,
+    profileManager,
+    providerManager
+  });
+
+  const vibeAgent = new VibeAgent({
+    profileManager,
+    providerManager,
+    quotaMonitor,
+    accountRouter,
+    routerEngine,
+    workspaceManager,
+    usageTracker
+  });
 
   // 1. Profiles & Quota Endpoints
   app.get('/api/profiles', async (req, res) => {
@@ -225,6 +254,60 @@ export function createServer() {
     }
   });
 
+  // 1.5 FreeLLMAPI Routing & External Providers Endpoints
+  app.get('/api/router/config', (req, res) => {
+    try {
+      res.json({
+        strategy: routerEngine.getStrategy(),
+        strategies: ROUTING_STRATEGIES,
+        chain: routerEngine.getRankedChain()
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/router/strategy', (req, res) => {
+    try {
+      const { strategy } = req.body;
+      const ok = routerEngine.setStrategy(strategy);
+      if (!ok) return res.status(400).json({ error: 'Неизвестная стратегия маршрутизации' });
+      res.json({ success: true, strategy: routerEngine.getStrategy() });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/providers', (req, res) => {
+    try {
+      res.json({ providers: providerManager.getProviders() });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.put('/api/providers/:id', (req, res) => {
+    try {
+      const updated = providerManager.updateProvider(req.params.id, req.body);
+      res.json({ success: true, provider: updated });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/providers/:id/test', async (req, res) => {
+    try {
+      const result = await providerManager.testProvider(req.params.id);
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 1.6 Universal OpenAI-Compatible API Gateway (/v1)
+  app.get('/v1/models', (req, res) => openAiGateway.handleListModels(req, res));
+  app.post('/v1/chat/completions', (req, res) => openAiGateway.handleChatCompletions(req, res));
+
   // 2. Project & Workspace Endpoints
   app.get('/api/projects', (req, res) => {
     try {
@@ -308,7 +391,7 @@ export function createServer() {
     }
   });
 
-  // 4. Git Endpoints
+  // 4. Git & GitHub Integration Endpoints
   app.get('/api/projects/:id/git/status', async (req, res) => {
     try {
       const projectPath = workspaceManager.getProjectPath(req.params.id);
@@ -319,17 +402,114 @@ export function createServer() {
     }
   });
 
-  app.post('/api/projects/:id/git/commit', async (req, res) => {
+  app.post('/api/projects/:id/git/remote', async (req, res) => {
     try {
-      const { message, push, token, remote, branch } = req.body;
+      const { remoteUrl, remoteName } = req.body;
       const projectPath = workspaceManager.getProjectPath(req.params.id);
-      await gitService.commit(projectPath, message || 'Update from Vibe-Coding Studio');
-      if (push) {
-        await gitService.push(projectPath, remote || 'origin', branch || 'main', token);
-      }
-      res.json({ success: true, message: 'Committed successfully' });
+      const result = await gitService.setRemote(projectPath, remoteName || 'origin', remoteUrl);
+      workspaceManager.updateProject(req.params.id, { githubRepo: result.webUrl });
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.delete('/api/projects/:id/git/remote', async (req, res) => {
+    try {
+      const projectPath = workspaceManager.getProjectPath(req.params.id);
+      await gitService.removeRemote(projectPath);
+      workspaceManager.updateProject(req.params.id, { githubRepo: null });
+      res.json({ success: true });
     } catch (err) {
       res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/projects/:id/git/commit', async (req, res) => {
+    try {
+      const { message, push, token, remote, branch, remoteUrl } = req.body;
+      const projectPath = workspaceManager.getProjectPath(req.params.id);
+      
+      // 1. Commit
+      const commitRes = await gitService.commit(
+        projectPath, 
+        message || 'Update from BLACKBORZ AI Studio'
+      );
+
+      let pushRes = null;
+      // 2. Push if requested
+      if (push) {
+        pushRes = await gitService.push(
+          projectPath, 
+          remote || 'origin', 
+          branch || 'main', 
+          token, 
+          remoteUrl
+        );
+        if (pushRes.webUrl) {
+          workspaceManager.updateProject(req.params.id, { githubRepo: pushRes.webUrl });
+        }
+      }
+
+      res.json({ 
+        success: true, 
+        committed: commitRes.committed, 
+        commitHash: commitRes.commitHash, 
+        pushed: Boolean(push),
+        pushResult: pushRes 
+      });
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
+  app.post('/api/projects/:id/git/pull', async (req, res) => {
+    try {
+      const { token, remote, branch } = req.body;
+      const projectPath = workspaceManager.getProjectPath(req.params.id);
+      const pullRes = await gitService.pull(projectPath, remote || 'origin', branch || 'main', token);
+      res.json({ success: true, pullResult: pullRes });
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
+  app.post('/api/github/verify-token', async (req, res) => {
+    try {
+      const { token } = req.body;
+      const verification = await gitService.verifyGitHubToken(token);
+      res.json(verification);
+    } catch (err) {
+      res.status(400).json({ valid: false, error: err.message });
+    }
+  });
+
+  app.post('/api/projects/:id/github/create-repo', async (req, res) => {
+    try {
+      const { token, repoName, description, isPrivate } = req.body;
+      const projectPath = workspaceManager.getProjectPath(req.params.id);
+
+      // 1. Create on GitHub
+      const repoData = await gitService.createGitHubRepo(token, repoName, description, isPrivate);
+
+      // 2. Set as origin remote
+      await gitService.setRemote(projectPath, 'origin', repoData.cloneUrl);
+      workspaceManager.updateProject(req.params.id, { githubRepo: repoData.htmlUrl });
+
+      // 3. Commit all files
+      await gitService.commit(projectPath, 'feat: initial commit from BLACKBORZ AI Studio');
+
+      // 4. Push to new repository
+      const pushRes = await gitService.push(projectPath, 'origin', 'main', token);
+
+      res.json({
+        success: true,
+        repo: repoData,
+        pushed: true,
+        pushResult: pushRes
+      });
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
     }
   });
 

@@ -89,6 +89,28 @@ export class WorkspaceManager {
     };
   }
 
+  updateProject(projectId, updates = {}) {
+    const projectPath = this.getProjectPath(projectId);
+    const metaPath = path.join(projectPath, '.meridian', 'project.json');
+    let meta = {};
+    if (fs.existsSync(metaPath)) {
+      try {
+        meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+      } catch {}
+    }
+    const updated = {
+      ...meta,
+      ...updates,
+      updatedAt: new Date().toISOString()
+    };
+    const metaDir = path.dirname(metaPath);
+    if (!fs.existsSync(metaDir)) {
+      fs.mkdirSync(metaDir, { recursive: true });
+    }
+    fs.writeFileSync(metaPath, JSON.stringify(updated, null, 2), 'utf8');
+    return { id: path.basename(projectPath), path: projectPath, ...updated };
+  }
+
   listProjects() {
     if (!fs.existsSync(this.workspacesDir)) return [];
     const entries = fs.readdirSync(this.workspacesDir, { withFileTypes: true });

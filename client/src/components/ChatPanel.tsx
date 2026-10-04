@@ -24,9 +24,18 @@ import {
 } from 'lucide-react';
 
 const AVAILABLE_MODELS = [
-  { id: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash', desc: 'Быстрый и мощный', icon: '⚡' },
-  { id: 'gemini-3-flash-preview', label: 'Gemini 3 Flash Preview', desc: 'Экспериментальный', icon: '🧪' },
-  { id: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash', desc: 'Сбалансированный', icon: '🔥' },
+  { id: 'auto:balanced', label: 'Auto: Сбалансированный', desc: 'Умный роутер: Google + Groq + OpenRouter', icon: '⚡', group: 'Умный роутер (FreeLLMAPI)' },
+  { id: 'auto:fastest', label: 'Auto: Макс. скорость', desc: 'Приоритет Groq LPU и Gemini Flash', icon: '🚀', group: 'Умный роутер (FreeLLMAPI)' },
+  { id: 'auto:smartest', label: 'Auto: Глубокий интеллект', desc: 'Приоритет DeepSeek R1 и Gemini Pro', icon: '🧠', group: 'Умный роутер (FreeLLMAPI)' },
+  { id: 'auto:least_exhausted', label: 'Auto: Защита квот', desc: 'Ротация по максимальному запасу квоты', icon: '🛡️', group: 'Умный роутер (FreeLLMAPI)' },
+  { id: 'auto:fusion', label: 'Fusion: Синтез моделей', desc: 'Консилиум и параллельный опрос моделей', icon: '🔮', group: 'Умный роутер (FreeLLMAPI)' },
+
+  { id: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash', desc: 'Пул из 5 Google аккаунтов (7 500 RPD)', icon: '💎', group: 'Google AI Studio Pool' },
+  { id: 'gemini-3-flash-preview', label: 'Gemini 3 Flash Preview', desc: 'Экспериментальная модель Google AI', icon: '🧪', group: 'Google AI Studio Pool' },
+  { id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash', desc: 'Быстрая и стабильная генерация', icon: '⚡', group: 'Google AI Studio Pool' },
+
+  { id: 'llama-3.3-70b-versatile', label: 'Llama 3.3 70B (Groq)', desc: 'Сверхбыстрый инференс LPU (~300 tok/s)', icon: '🦙', group: 'Free Провайдеры' },
+  { id: 'deepseek/deepseek-r1:free', label: 'DeepSeek R1 (OpenRouter)', desc: 'Бесплатные рассуждения (Reasoning)', icon: '🐋', group: 'Free Провайдеры' },
 ];
 
 // Code block with copy button
@@ -472,32 +481,50 @@ export function ChatPanel({
                 </button>
 
                 {isModelDropdownOpen && (
-                  <div className="absolute bottom-full left-0 mb-2 w-64 bg-neutral-950 border border-white/15 rounded-2xl shadow-[0_15px_50px_rgba(0,0,0,0.8)] overflow-hidden z-50">
-                    <div className="px-3 py-2 border-b border-white/10 text-[10px] font-bold text-neutral-500 uppercase tracking-wider">
-                      Выбор модели
+                  <div className="absolute bottom-full left-0 mb-2 w-72 sm:w-80 bg-neutral-950 border border-white/15 rounded-2xl shadow-[0_20px_60px_rgba(0,0,0,0.9)] overflow-hidden z-50 max-h-96 overflow-y-auto">
+                    <div className="px-3.5 py-2.5 border-b border-white/10 bg-black/60 flex items-center justify-between sticky top-0 z-10 backdrop-blur-md">
+                      <span className="text-[10px] font-bold text-neutral-400 uppercase tracking-wider">
+                        Выбор модели & роутера
+                      </span>
+                      <span className="text-[10px] font-mono text-emerald-400 font-semibold">
+                        FreeLLMAPI Active
+                      </span>
                     </div>
-                    {AVAILABLE_MODELS.map((model) => (
-                      <button
-                        key={model.id}
-                        type="button"
-                        onClick={() => {
-                          if (onModelChange) onModelChange(model.id);
-                          setIsModelDropdownOpen(false);
-                        }}
-                        className={`w-full px-3 py-2.5 flex items-center gap-3 text-left hover:bg-white/5 transition-colors cursor-pointer ${
-                          selectedModel === model.id ? 'bg-white/10' : ''
-                        }`}
-                      >
-                        <span className="text-base">{model.icon}</span>
-                        <div className="flex-1 min-w-0">
-                          <div className="text-xs font-semibold text-white">{model.label}</div>
-                          <div className="text-[10px] text-neutral-500">{model.desc}</div>
+
+                    {['Умный роутер (FreeLLMAPI)', 'Google AI Studio Pool', 'Free Провайдеры'].map((groupName) => {
+                      const groupModels = AVAILABLE_MODELS.filter(m => m.group === groupName);
+                      if (groupModels.length === 0) return null;
+
+                      return (
+                        <div key={groupName} className="py-1">
+                          <div className="px-3.5 py-1 text-[10px] font-mono font-semibold text-neutral-500 uppercase tracking-wider bg-white/[0.02]">
+                            {groupName}
+                          </div>
+                          {groupModels.map((model) => (
+                            <button
+                              key={model.id}
+                              type="button"
+                              onClick={() => {
+                                if (onModelChange) onModelChange(model.id);
+                                setIsModelDropdownOpen(false);
+                              }}
+                              className={`w-full px-3.5 py-2 flex items-center gap-3 text-left hover:bg-white/5 transition-colors cursor-pointer ${
+                                selectedModel === model.id ? 'bg-white/10 border-l-2 border-emerald-400' : ''
+                              }`}
+                            >
+                              <span className="text-base shrink-0">{model.icon}</span>
+                              <div className="flex-1 min-w-0">
+                                <div className="text-xs font-semibold text-white truncate">{model.label}</div>
+                                <div className="text-[10px] text-neutral-400 truncate">{model.desc}</div>
+                              </div>
+                              {selectedModel === model.id && (
+                                <Check className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                              )}
+                            </button>
+                          ))}
                         </div>
-                        {selectedModel === model.id && (
-                          <Check className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                        )}
-                      </button>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
               </div>

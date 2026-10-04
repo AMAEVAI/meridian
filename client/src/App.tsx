@@ -29,7 +29,7 @@ export default function App() {
   // Chat State
   const [messages, setMessages] = useState([]);
   const [isGenerating, setIsGenerating] = useState(false);
-  const [selectedModel, setSelectedModel] = useState('gemini-3.8-flash-high');
+  const [selectedModel, setSelectedModel] = useState('auto:balanced');
   const [activeAccountNotice, setActiveAccountNotice] = useState('');
 
   const wsRef = useRef(null);
@@ -386,18 +386,25 @@ export default function App() {
 
   // 5. Commit & Push
   const handleCommitPush = async (commitData) => {
-    if (!currentProject) return;
+    if (!currentProject) return { success: false, error: 'Проект не выбран' };
     setIsCommitting(true);
     try {
-      await fetch(`/api/projects/${currentProject.id}/git/commit`, {
+      const res = await fetch(`/api/projects/${currentProject.id}/git/commit`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(commitData)
       });
-      fetchGitStatus(currentProject.id);
-      setIsGitModalOpen(false);
+      const data = await res.json();
+      if (res.ok && data.success) {
+        fetchGitStatus(currentProject.id);
+        fetchProjects();
+        return data;
+      } else {
+        return { success: false, error: data.error || 'Ошибка при выполнении коммита или push' };
+      }
     } catch (e) {
       console.error('Commit failed', e);
+      return { success: false, error: e.message };
     } finally {
       setIsCommitting(false);
     }
@@ -474,6 +481,10 @@ export default function App() {
         gitStatus={gitStatus}
         onCommitPush={handleCommitPush}
         isCommitting={isCommitting}
+        onRefreshStatus={() => {
+          if (currentProject?.id) fetchGitStatus(currentProject.id);
+          fetchProjects();
+        }}
       />
 
       {/* Create Project Modal */}
